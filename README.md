@@ -108,8 +108,8 @@ Or just describe what you want in natural language — Claude Code will invoke t
 
 The onenote and office skills cache API responses locally for speed:
 
-- `onenote/references/` — notebook/section/page index and page content
-- `office/references/excel/` — Excel tab descriptions
+- `onenote/cache/` — notebook/section/page index and page content
+- `office/cache/excel/` — Excel tab descriptions
 
 These directories are in `.gitignore` and never committed. They are rebuilt automatically on first use on a new machine.
 

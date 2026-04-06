@@ -13,8 +13,8 @@ author: clawdi
 - Auth helper + Graph client: `~/.claude/skills/onenote/scripts/onenote_setup.py`
 - Operations script: `~/.claude/skills/onenote/scripts/onenote_ops.py`
 - Token cache: `~/.cache/ms_graph_token_cache.json` (no login needed)
-- Cache: `~/.claude/skills/onenote/references/onenote_cache.json` (never read directly — too large)
-- Search index: `~/.claude/skills/onenote/references/page_index.txt` (grep-able, ~9K tokens)
+- Cache: `~/.claude/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
+- Search index: `~/.claude/skills/onenote/cache/page_index.txt` (grep-able, ~9K tokens)
 
 ## Cache (AUTO — always do this)
 

@@ -114,6 +114,6 @@ Or describe what you want in natural language — Claude Code will invoke the sk
 
 The skill caches Excel tab descriptions locally to avoid redundant API calls:
 
-- `references/excel/<file_id>.json` — tab descriptions and staleness metadata per file
+- `cache/excel/<file_id>.json` — tab descriptions and staleness metadata per file
 
 These are in `.gitignore` and never committed. They are rebuilt automatically on first use or when the file is modified.

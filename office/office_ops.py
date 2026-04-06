@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore', category=Warning, module='urllib3')
 sys.path.insert(0, str(Path(__file__).parent.parent / 'onenote' / 'scripts'))
 from onenote_setup import get_access_token
 
-EXCEL_CACHE_DIR = Path.home() / '.claude' / 'skills' / 'office' / 'references' / 'excel'
+EXCEL_CACHE_DIR = Path.home() / '.claude' / 'skills' / 'office' / 'cache' / 'excel'
 EXCEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _cache_path(file_id: str) -> Path:

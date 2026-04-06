@@ -82,7 +82,7 @@ python3 ~/.claude/skills/office/office_ops.py pptx-read --file-path "Documents/d
 ## Excel Tab Cache (AUTO — do this every time)
 
 Whenever you open an Excel file:
-1. Check `~/.claude/skills/office/references/excel/` for a cached `.json` file for that `file_id`
+1. Check `~/.claude/skills/office/cache/excel/` for a cached `.json` file for that `file_id`
 2. If cache exists and fresh, load tabs — no API call needed
 3. If stale or missing, rebuild (see below)
 
@@ -164,7 +164,7 @@ python3 ~/.claude/skills/office/office_ops.py pptx-read --file-path "deck.pptx" 
 
 ## Key Notes
 
-- **Always check the Excel cache before any API call** — cache lives in `~/.claude/skills/office/references/excel/`
+- **Always check the Excel cache before any API call** — cache lives in `~/.claude/skills/office/cache/excel/`
 - For shared files (Roshan's OneDrive), always pass `drive_id='58B31B88585CA325'`
 - Excel reads use a persistent workbook session (fast after first call ~0.5s vs ~3.5s cold)
 - Excel writes use `persistChanges=True` session — changes are committed to the file

@@ -21,7 +21,7 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-REFS_DIR         = Path(__file__).parent.parent / 'references'
+REFS_DIR         = Path(__file__).parent.parent / 'cache'
 CACHE_JSON       = REFS_DIR / 'onenote_cache.json'
 PAGE_INDEX       = REFS_DIR / 'page_index.txt'
 PAGE_CONTENT_DIR = REFS_DIR / 'page_content'

@@ -105,8 +105,8 @@ Or describe what you want in natural language — Claude Code will invoke the sk
 
 The skill caches API responses locally for speed:
 
-- `references/onenote_cache.json` — full notebook/section/page index (never read directly — too large)
-- `references/page_index.txt` — grep-able search index (~9K tokens)
-- `references/page_content/` — individual page HTML snapshots
+- `cache/onenote_cache.json` — full notebook/section/page index (never read directly — too large)
+- `cache/page_index.txt` — grep-able search index (~9K tokens)
+- `cache/page_content/` — individual page HTML snapshots
 
 These are in `.gitignore` and never committed. They are rebuilt automatically on first use on a new machine.
