@@ -87,14 +87,17 @@ asyncio.run(main())
 import asyncio, sys
 sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/onenote/scripts'))
 from onenote_setup import make_graph_client
-from onenote_ops import get_sections, get_pages, find_page, update_page, create_page
+from onenote_ops import get_sections, get_pages, find_page, update_page, append_to_page, create_page
 
 async def main():
     client = make_graph_client()
 
-    # Update an existing page
+    # Append to a page with a single note container (preferred — preserves existing content)
     page = await find_page(client, "Health", "Supplements", "My Stack")
-    await update_page(client, page['id'], "<p>Updated content</p>")
+    await append_to_page(client, page['id'], "<p>New entry added at the bottom.</p>")
+
+    # Replace the entire body of a page (use only when a full rewrite is intended)
+    await update_page(client, page['id'], "<p>Replaced content</p>")
 
     # Create a new page
     sections = await get_sections(client, "Home Stuff")
@@ -103,6 +106,13 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### Write rules
+
+- **Prefer `append_to_page` over `update_page`** for adding content — it preserves existing page content.
+- `append_to_page` only works on pages with exactly one note container; raises `ValueError` otherwise.
+- `update_page` replaces the full page body — read the page HTML first and include all content you want to keep.
+- Always read the page HTML before any write to understand the current structure.
 
 ## Parsing Note Containers
 
@@ -124,8 +134,9 @@ When asked "what's in X", list containers first if the page appears to have mult
 
 ## Rules
 
-- **Always read before writing** — fetch the page HTML first to preserve structure
+- **Prefer `append_to_page` for writes** — it preserves existing content without reading first
+- `append_to_page()` only supports pages with exactly one note container; raises `ValueError` otherwise
+- `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep
 - `find_page()` does case-insensitive title matching
-- `update_page()` replaces the full body — include all existing content you want to keep
 - `strip_html()` from onenote_ops gives clean readable text from page HTML
 - Pages return HTML — strip for display, keep raw for updates

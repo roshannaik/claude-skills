@@ -14,7 +14,7 @@ Performance design:
 - Page content cached per page_id, invalidated by last_modified from Graph API.
 - Parallel section/page fetches via asyncio.gather() on refresh.
 """
-import asyncio, sys, os, re, json, time, argparse, warnings, signal
+import asyncio, sys, os, re, json, time, argparse, warnings, signal, urllib.request
 warnings.filterwarnings('ignore', category=Warning, module='urllib3')
 from pathlib import Path
 from datetime import datetime
@@ -548,13 +548,62 @@ async def refresh_all_notebooks(client) -> dict:
     return dict(results)
 
 
-async def update_page(client, page_id: str, new_html_content: str):
-    patch_body = [{"target": "body", "action": "replace", "content": new_html_content}]
-    return await client.patch(
-        f"/me/onenote/pages/{page_id}/content",
-        data=json.dumps(patch_body),
-        headers={"Content-Type": "application/json"}
+def _patch_page_content(page_id: str, patch_body: list) -> None:
+    """Send a PATCH request to the OneNote page content endpoint."""
+    from onenote_setup import get_access_token
+    token = get_access_token()
+    url = f'https://graph.microsoft.com/v1.0/me/onenote/pages/{page_id}/content'
+    data = json.dumps(patch_body).encode('utf-8')
+    req = urllib.request.Request(
+        url, data=data,
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        method='PATCH',
     )
+    with urllib.request.urlopen(req):
+        pass
+
+
+async def update_page(client, page_id: str, new_html_content: str):
+    """Replace the entire body of a OneNote page."""
+    _patch_page_content(page_id, [{"target": "body", "action": "replace", "content": new_html_content}])
+
+
+def _count_containers(html: str) -> int:
+    """Count absolute-positioned note containers in page HTML."""
+    return len(re.findall(r'<div\b[^>]*style="[^"]*position:absolute[^"]*"', html, re.IGNORECASE))
+
+
+async def append_to_page(client, page_id: str, new_html_content: str):
+    """Append content inside the single note container of a page.
+
+    Reads the current page HTML, verifies it has exactly one note container,
+    then inserts new_html_content inside that container before its closing </div>.
+
+    Raises ValueError if the page has zero or multiple note containers.
+    """
+    from onenote_setup import get_page_content
+    html = await get_page_content(client, page_id)
+
+    n = _count_containers(html)
+    if n == 0:
+        raise ValueError("Page has no note containers.")
+    if n > 1:
+        raise ValueError(
+            f"Page has {n} note containers — only single-container pages are supported for appending."
+        )
+
+    body_match = re.search(r'<body[^>]*>(.*)</body>', html, re.DOTALL | re.IGNORECASE)
+    if not body_match:
+        raise ValueError("Could not parse page body.")
+    body = body_match.group(1)
+
+    last_div = body.rfind('</div>')
+    if last_div == -1:
+        raise ValueError("Could not find closing </div> in page body.")
+
+    modified_body = body[:last_div] + new_html_content + body[last_div:]
+    _patch_page_content(page_id, [{"target": "body", "action": "replace", "content": modified_body}])
+
 
 async def create_page(client, section_id: str, title: str, html_body: str):
     html = f"""<!DOCTYPE html>
