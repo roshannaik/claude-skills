@@ -1,0 +1,20 @@
+# Skills not created by me
+last30days/
+
+# Dev/scratch files
+onenote/scripts/benchmark.py
+onenote/scripts/benchmark_results.json
+
+# Personal cache data — never commit
+onenote/references/
+office/references/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
