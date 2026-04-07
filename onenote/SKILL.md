@@ -83,21 +83,29 @@ asyncio.run(main())
 
 ## Write Operations (inline Python)
 
+For pages with a single note container, the standard write pattern is:
+
+1. Read the page to get its HTML
+2. Call `get_container_html(html)` to extract the container's inner HTML
+3. Inspect the structure (list, table, dated entries, sections, etc.) and decide where the new content belongs
+4. Build the modified inner HTML with the new content inserted at the right location
+5. Call `update_page` with `set_container_html(html, modified_inner)`
+
 ```python
 import asyncio, sys
 sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/onenote/scripts'))
 from onenote_setup import make_graph_client
-from onenote_ops import get_sections, get_pages, find_page, update_page, append_to_page, create_page
+from onenote_ops import get_sections, get_pages, find_page, update_page, get_container_html, set_container_html, create_page
 
 async def main():
     client = make_graph_client()
 
-    # Append to a page with a single note container (preferred — preserves existing content)
-    page = await find_page(client, "Health", "Supplements", "My Stack")
-    await append_to_page(client, page['id'], "<p>New entry added at the bottom.</p>")
-
-    # Replace the entire body of a page (use only when a full rewrite is intended)
-    await update_page(client, page['id'], "<p>Replaced content</p>")
+    # Write to a single-container page at the right location
+    page = await find_page(client, "AI", "MyAgent", "TODO")
+    inner = get_container_html(page['html'])
+    # Inspect `inner`, decide where the new item belongs, then:
+    modified_inner = inner + "<p>new todo item</p>"   # example: append at end
+    await update_page(client, page['id'], set_container_html(page['html'], modified_inner))
 
     # Create a new page
     sections = await get_sections(client, "Home Stuff")
@@ -109,10 +117,11 @@ asyncio.run(main())
 
 ### Write rules
 
-- **Prefer `append_to_page` over `update_page`** for adding content — it preserves existing page content.
-- `append_to_page` only works on pages with exactly one note container; raises `ValueError` otherwise.
-- `update_page` replaces the full page body — read the page HTML first and include all content you want to keep.
-- Always read the page HTML before any write to understand the current structure.
+- **Always use `get_container_html` / `set_container_html`** for single-container pages — never blindly append to the raw body.
+- Read `inner` HTML before writing — inspect the structure (list items, table rows, dated entries, headings) and insert at the semantically correct location.
+- Both helpers raise `ValueError` if the page has zero or multiple containers.
+- `update_page` replaces the full page body — always reconstruct from the original `html` via `set_container_html` to avoid losing content.
+- For full rewrites (rare), pass new body HTML directly to `update_page`.
 
 ## Parsing Note Containers
 
@@ -134,8 +143,8 @@ When asked "what's in X", list containers first if the page appears to have mult
 
 ## Rules
 
-- **Prefer `append_to_page` for writes** — it preserves existing content without reading first
-- `append_to_page()` only supports pages with exactly one note container; raises `ValueError` otherwise
+- **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages
+- Both helpers raise `ValueError` if the page does not have exactly one note container
 - `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep
 - `find_page()` does case-insensitive title matching
 - `strip_html()` from onenote_ops gives clean readable text from page HTML

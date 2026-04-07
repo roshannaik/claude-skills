@@ -568,41 +568,51 @@ async def update_page(client, page_id: str, new_html_content: str):
     _patch_page_content(page_id, [{"target": "body", "action": "replace", "content": new_html_content}])
 
 
-def _count_containers(html: str) -> int:
-    """Count absolute-positioned note containers in page HTML."""
-    return len(re.findall(r'<div\b[^>]*style="[^"]*position:absolute[^"]*"', html, re.IGNORECASE))
+_CONTAINER_RE = re.compile(
+    r'(<div\b[^>]*style="[^"]*position:absolute[^"]*"[^>]*>)(.*?)(</div>)',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
-async def append_to_page(client, page_id: str, new_html_content: str):
-    """Append content inside the single note container of a page.
+def _get_body(html: str) -> str:
+    m = re.search(r'<body[^>]*>(.*)</body>', html, re.DOTALL | re.IGNORECASE)
+    if not m:
+        raise ValueError("Could not parse page body.")
+    return m.group(1)
 
-    Reads the current page HTML, verifies it has exactly one note container,
-    then inserts new_html_content inside that container before its closing </div>.
+
+def get_container_html(html: str) -> str:
+    """Return the inner HTML of the single note container in a page.
 
     Raises ValueError if the page has zero or multiple note containers.
+    Use this to read the container before deciding where to insert new content.
     """
-    from onenote_setup import get_page_content
-    html = await get_page_content(client, page_id)
-
-    n = _count_containers(html)
-    if n == 0:
+    matches = _CONTAINER_RE.findall(_get_body(html))
+    if len(matches) == 0:
         raise ValueError("Page has no note containers.")
-    if n > 1:
+    if len(matches) > 1:
         raise ValueError(
-            f"Page has {n} note containers — only single-container pages are supported for appending."
+            f"Page has {len(matches)} note containers — only single-container pages are supported."
         )
+    return matches[0][1]  # group 2: inner HTML
 
-    body_match = re.search(r'<body[^>]*>(.*)</body>', html, re.DOTALL | re.IGNORECASE)
-    if not body_match:
-        raise ValueError("Could not parse page body.")
-    body = body_match.group(1)
 
-    last_div = body.rfind('</div>')
-    if last_div == -1:
-        raise ValueError("Could not find closing </div> in page body.")
+def set_container_html(html: str, new_inner: str) -> str:
+    """Return the page body HTML with the single container's inner HTML replaced by new_inner.
 
-    modified_body = body[:last_div] + new_html_content + body[last_div:]
-    _patch_page_content(page_id, [{"target": "body", "action": "replace", "content": modified_body}])
+    The return value is the body content ready to pass directly to update_page().
+    Raises ValueError if the page has zero or multiple note containers.
+    """
+    body = _get_body(html)
+    matches = list(_CONTAINER_RE.finditer(body))
+    if len(matches) == 0:
+        raise ValueError("Page has no note containers.")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Page has {len(matches)} note containers — only single-container pages are supported."
+        )
+    m = matches[0]
+    return body[:m.start(2)] + new_inner + body[m.end(2):]
 
 
 async def create_page(client, section_id: str, title: str, html_body: str):
