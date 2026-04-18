@@ -29,7 +29,12 @@ EMBEDDINGS_META = REFS_DIR / 'embeddings_meta.json'
 MODEL            = 'gemini-embedding-001'
 EMBED_DIM        = 1024           # MRL-truncated from 3072
 MAX_CHARS        = 32000          # per-page cap before sending to the API
-BATCH_SIZE       = 100            # Gemini embed_content accepts up to 100 texts per call
+
+# Gemini free tier for gemini-embedding-001 is ~5 RPM / 30K TPM.
+# A batch of ~10 pages averages 15-25K tokens, safely under TPM.
+# Sleeping 15s between batches keeps us under 5 RPM (one call per 12s).
+BATCH_SIZE       = 10
+INTER_BATCH_SLEEP = 15.0
 
 TASK_DOCUMENT = 'RETRIEVAL_DOCUMENT'
 TASK_QUERY    = 'RETRIEVAL_QUERY'
@@ -192,32 +197,64 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
     new_page_meta: dict = {}
     t0 = time.time()
 
-    for i in range(0, len(to_embed), BATCH_SIZE):
-        batch = to_embed[i:i + BATCH_SIZE]
-        texts = [t for _, t, _ in batch]
-        try:
-            embeddings = _embed_with_retry(texts)
-        except Exception as e:
-            # If a batch payload is too big, split in half
-            if len(batch) > 1 and ('payload' in str(e).lower() or 'too large' in str(e).lower()
-                                   or 'INVALID_ARGUMENT' in str(e)):
-                print(f"  ! batch of {len(batch)} rejected ({e}); splitting", file=sys.stderr)
-                mid = len(batch) // 2
-                embeddings = _embed_with_retry([t for _, t, _ in batch[:mid]]) + \
-                             _embed_with_retry([t for _, t, _ in batch[mid:]])
-            else:
-                raise
+    def _checkpoint():
+        """Write a partial .npz + meta so a mid-run crash keeps progress."""
+        merged_vecs = {pid: v for pid, v in carry}
+        merged_vecs.update(new_vecs)
+        merged_meta = {pid: meta['pages'].get(pid, {}) for pid, _ in carry}
+        merged_meta.update(new_page_meta)
+        valid = {p[3] for p in _enumerate_pages()}
+        merged_vecs = {pid: v for pid, v in merged_vecs.items() if pid in valid}
+        merged_meta = {pid: m for pid, m in merged_meta.items() if pid in valid}
+        sids = sorted(merged_vecs.keys())
+        if sids:
+            vectors = np.stack([merged_vecs[i] for i in sids]).astype(np.float32)
+            np.savez(EMBEDDINGS_NPZ, ids=np.array(sids), vectors=vectors)
+        EMBEDDINGS_META.write_text(json.dumps({
+            'model':    MODEL,
+            'dim':      EMBED_DIM,
+            'built_at': datetime.now(timezone.utc).isoformat(),
+            'pages':    merged_meta,
+        }, indent=2))
 
-        for (pid, _, pmeta), vec in zip(batch, embeddings):
-            v = np.asarray(vec, dtype=np.float32)
-            n = np.linalg.norm(v)
-            if n > 0:
-                v = v / n
-            new_vecs[pid] = v
-            new_page_meta[pid] = pmeta
+    try:
+        for i in range(0, len(to_embed), BATCH_SIZE):
+            batch = to_embed[i:i + BATCH_SIZE]
+            texts = [t for _, t, _ in batch]
+            try:
+                embeddings = _embed_with_retry(texts)
+            except Exception as e:
+                if len(batch) > 1 and ('payload' in str(e).lower() or 'too large' in str(e).lower()
+                                       or 'INVALID_ARGUMENT' in str(e)):
+                    print(f"  ! batch of {len(batch)} rejected ({e}); splitting", file=sys.stderr)
+                    mid = len(batch) // 2
+                    embeddings = _embed_with_retry([t for _, t, _ in batch[:mid]]) + \
+                                 _embed_with_retry([t for _, t, _ in batch[mid:]])
+                else:
+                    raise
 
-        print(f"  [{min(i + BATCH_SIZE, len(to_embed))}/{len(to_embed)}] embedded",
-              file=sys.stderr)
+            for (pid, _, pmeta), vec in zip(batch, embeddings):
+                v = np.asarray(vec, dtype=np.float32)
+                n = np.linalg.norm(v)
+                if n > 0:
+                    v = v / n
+                new_vecs[pid] = v
+                new_page_meta[pid] = pmeta
+
+            done_n = min(i + BATCH_SIZE, len(to_embed))
+            print(f"  [{done_n}/{len(to_embed)}] embedded", file=sys.stderr)
+
+            # Checkpoint every 50 pages so a later failure keeps progress
+            if done_n % 50 == 0 or done_n == len(to_embed):
+                _checkpoint()
+
+            # Pace for RPM cap — skip on the final batch
+            if done_n < len(to_embed):
+                time.sleep(INTER_BATCH_SLEEP)
+    except KeyboardInterrupt:
+        print("\nInterrupted — checkpointing partial progress.", file=sys.stderr)
+        _checkpoint()
+        raise
 
     elapsed = time.time() - t0
 
@@ -301,7 +338,30 @@ def semantic_search(query: str, top_k: int = 10,
     page_meta = meta.get('pages', {})
 
     client = _get_client()
-    vecs = _embed_call(client, [query], TASK_QUERY)
+
+    # Retry on rate-limit, honoring the Retry-After hint in the error
+    import re as _re
+    last_err = None
+    for attempt in range(5):
+        try:
+            vecs = _embed_call(client, [query], TASK_QUERY)
+            break
+        except Exception as e:
+            msg = str(e)
+            is_rate = ('429' in msg or 'RESOURCE_EXHAUSTED' in msg
+                       or 'rate' in msg.lower() or 'quota' in msg.lower())
+            if not is_rate or attempt == 4:
+                raise
+            # Parse the "retry in Xs" hint if present, else exponential backoff
+            m = _re.search(r'retry in ([\d.]+)s', msg, _re.I)
+            wait = min(60, float(m.group(1)) + 1 if m else 4 * (2 ** attempt))
+            print(f"  ! rate limited; sleeping {wait:.0f}s (attempt {attempt+1}/5)",
+                  file=sys.stderr)
+            time.sleep(wait)
+            last_err = e
+    else:
+        raise last_err
+
     q = np.asarray(vecs[0], dtype=np.float32)
     n = np.linalg.norm(q)
     if n > 0:

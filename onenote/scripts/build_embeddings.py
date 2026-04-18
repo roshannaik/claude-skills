@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Voyage embeddings for cached OneNote pages.
+"""Build Gemini embeddings for cached OneNote pages.
 
 Incremental: pages whose last_modified matches the stored meta are skipped.
 Force-rebuild: pass --force.
@@ -30,7 +30,7 @@ def main():
     result = build_embeddings(force=args.force, notebook_filter=nb_filter)
     print(f"\nDone: total={result['total']}, rebuilt={result['rebuilt']}, "
           f"reused={result['reused']}, skipped_no_content={result['skipped_no_content']}, "
-          f"tokens={result['tokens']}, elapsed={result['elapsed']}s")
+          f"elapsed={result['elapsed']}s")
 
 
 if __name__ == '__main__':
