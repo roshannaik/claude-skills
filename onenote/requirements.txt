@@ -3,3 +3,5 @@ msgraph-sdk>=1.0
 kiota-abstractions>=1.0
 kiota-authentication-azure>=1.0
 kiota-http>=1.0
+voyageai>=0.2
+numpy>=1.24
