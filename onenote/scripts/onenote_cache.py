@@ -88,17 +88,23 @@ def _load_page_index() -> list:
 # Lookup helpers — no API, no heavy imports
 # ---------------------------------------------------------------------------
 
+def _norm(s: str) -> str:
+    """Normalize a name for comparison: lowercase + strip whitespace.
+    OneNote titles sometimes carry trailing spaces that aren't visible in the UI."""
+    return (s or '').strip().lower()
+
+
 def lookup_notebook(name: str) -> dict:
     cache = _load_cache()
     return next((v for k, v in cache.items()
-                 if not k.startswith('_') and k.lower() == name.lower()), None)
+                 if not k.startswith('_') and _norm(k) == _norm(name)), None)
 
 def lookup_section(notebook: str, section: str) -> dict:
     nb = lookup_notebook(notebook)
     if not nb:
         return None
     return next((v for k, v in nb.get('sections', {}).items()
-                 if k.lower() == section.lower()), None)
+                 if _norm(k) == _norm(section)), None)
 
 def lookup_page(notebook: str, section: str, title: str) -> dict:
     sec = lookup_section(notebook, section)
@@ -106,7 +112,7 @@ def lookup_page(notebook: str, section: str, title: str) -> dict:
         return None
     for page in sec.get('pages', []):
         t = page['title'] if isinstance(page, dict) else page
-        if t.lower() == title.lower():
+        if _norm(t) == _norm(title):
             return page if isinstance(page, dict) else {'title': t, 'id': '', 'last_modified': ''}
     return None
 

@@ -121,7 +121,8 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
         return {'id': page_id, 'title': page_title, 'content': strip_html(html), 'html': html}
 
     pages = await get_pages(_lazy_client(), notebook_name, section_name)
-    page  = next((p for p in pages if p['title'].lower() == page_title.lower()), None)
+    q = (page_title or '').strip().lower()
+    page = next((p for p in pages if p['title'].strip().lower() == q), None)
     if not page:
         raise ValueError(f"Page '{page_title}' not found in {notebook_name}/{section_name}. "
                          f"Available: {[p['title'] for p in pages]}")
