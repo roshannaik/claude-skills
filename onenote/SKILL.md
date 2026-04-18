@@ -181,12 +181,13 @@ When asked "what's in X", list containers first if the page appears to have mult
 
 ## Rules
 
+- **Answer concisely.** Lead with the direct answer to the user's question, then supporting detail only if it adds value. Prefer a short paragraph or a tight table over bulleted dumps. Skip source-page citations unless the user asks where it came from. Skip process narration ("I searched for X, then I read Y…") — the user doesn't need it.
 - **Semantic search first.** For any content question ("where is info about X", "what do my notes say about Y"), start with `semantic-search`. Tier 2/3 are for when the user names an exact page or keyword.
 - **Never read `onenote_cache.json` directly** — use the CLI.
 - **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages.
 - Both container helpers raise `ValueError` if the page does not have exactly one container.
 - `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep.
-- `find_page()` does case-insensitive title matching.
+- `find_page()` does case-insensitive, whitespace-insensitive title matching.
 - `strip_html()` from onenote_ops gives clean readable text from page HTML.
 - Pages return HTML — strip for display, keep raw for updates.
 - After writing/editing a page, re-run `build_embeddings.py` to refresh that page's embedding (incremental — only the edited page is re-embedded).
