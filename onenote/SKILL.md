@@ -13,25 +13,71 @@ author: clawdi
 - Auth helper + Graph client: `~/.claude/skills/onenote/scripts/onenote_setup.py`
 - Operations script: `~/.claude/skills/onenote/scripts/onenote_ops.py`
 - Token cache: `~/.cache/ms_graph_token_cache.json` (no login needed)
-- Cache: `~/.claude/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
-- Search index: `~/.claude/skills/onenote/cache/page_index.txt` (grep-able, ~9K tokens)
+- Metadata cache: `~/.claude/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
+- Title index: `~/.claude/skills/onenote/cache/page_index.txt` (1K lines, page titles + paths)
+- Page content cache: `~/.claude/skills/onenote/cache/page_content/*.html` (keyed by page ID)
+- **Semantic summaries**: `~/.claude/skills/onenote/cache/summaries/<Notebook>.md` — hierarchical Haiku-generated summaries of notebook → sections → pages, built for semantic routing
 
-## Cache (AUTO — always do this)
+**Never read `onenote_cache.json` directly** — use the CLI, which reads it internally.
 
-**Never read `onenote_cache.json` directly** — it's 140K+ chars and will flood context.
+## Search strategies — pick the right tier
 
-Instead use the CLI which reads the cache internally:
+Escalate only as needed. Cheaper tiers first.
+
+| Tier | When | Cost | Command |
+|------|------|------|---------|
+| **1. Title search** | User names a page, or you know the exact title | instant, no API | `onenote_ops.py search "<title keyword>"` |
+| **2. Content grep** | Exact keyword match in already-cached pages | ~100ms, no API | `onenote_ops.py search-content "<keyword>"` |
+| **3. Semantic summary** | "Where is info about X?" / conceptual, not just keyword | instant, no API, no subprocess | `onenote_ops.py routing-index [--notebook Health]` → you pick pages inline |
+| **4. Full page read** | After routing via any tier above, to get the actual content | 1 API call per page (cached after first fetch) | `onenote_ops.py read-page <nb> <sec> <page>` |
+
+### Semantic routing (Tier 3) — primary fast path for content questions
+
+Print the compact routing index (~2.4K tokens) and pick the 1-3 best-matching pages yourself inline. No subprocess, no extra model call, works with any underlying model.
 
 ```bash
-# Search page titles across all notebooks (fastest — no API)
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py search "supplements"
-
-# If you know the notebook/section, go directly:
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py list-pages "Health" "Supplements"
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page "Health" "Supplements" "Probiotics"
+# Print compact index — you read this and pick targets
+python3 ~/.claude/skills/onenote/scripts/onenote_ops.py routing-index --notebook Health
 ```
 
-Cache auto-updates when `get_sections()` or `get_pages()` are called. The daemon keeps it warm.
+The index is hierarchical: notebook summary → per-section summary + page titles. Read it, identify the 1-3 pages most relevant to the query, then fetch only those.
+
+```bash
+# Fetch the target pages
+python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page "Health" "<Section>" "<Page>"
+```
+
+Available notebooks with summaries:
+```bash
+ls ~/.claude/skills/onenote/cache/summaries/*.json
+```
+
+If the target notebook has no summary yet, fall through to Tier 1/2 or build one (see "Building summaries").
+
+### Standard workflow for content questions
+
+```
+1. routing-index --notebook Health    # ~instant, ~2.4K tokens into context
+2. Pick 1-3 target pages from the index
+3. read-page for each target          # ~instant if cached
+4. Answer from content
+```
+
+
+## Building summaries
+
+Summaries are built per-notebook via Haiku. First build for a notebook takes ~5–10 min; subsequent builds are incremental (only pages with changed `last_modified` are re-summarized).
+
+```bash
+# Build summaries for a notebook (uses claude -p --model haiku per page)
+python3 ~/.claude/skills/onenote/scripts/build_summaries.py "Health" --concurrency 10 --max-chars 80000
+```
+
+Outputs:
+- `cache/summaries/<Notebook>.md` — hierarchical markdown (read by the LLM for routing)
+- `cache/summaries/<Notebook>.json` — machine-readable state (used for incremental regen)
+
+Re-run the same command after pages are edited; only changed pages hit Haiku. To force regeneration of specific pages, delete their entries from the `.json` file and re-run.
 
 ## Read Operations
 
@@ -143,9 +189,12 @@ When asked "what's in X", list containers first if the page appears to have mult
 
 ## Rules
 
-- **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages
-- Both helpers raise `ValueError` if the page does not have exactly one note container
-- `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep
-- `find_page()` does case-insensitive title matching
-- `strip_html()` from onenote_ops gives clean readable text from page HTML
-- Pages return HTML — strip for display, keep raw for updates
+- **Route with summaries before fetching pages.** For any content question ("where is info about X", "what does my notes say about Y"), prefer Tier 3 (semantic summary) over blindly reading pages. Only escalate to full page reads after the summary has narrowed candidates.
+- **Never read `onenote_cache.json` directly** — use the CLI.
+- **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages.
+- Both container helpers raise `ValueError` if the page does not have exactly one container.
+- `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep.
+- `find_page()` does case-insensitive title matching.
+- `strip_html()` from onenote_ops gives clean readable text from page HTML.
+- Pages return HTML — strip for display, keep raw for updates.
+- After writing/editing a page, re-run `build_summaries.py <notebook>` to refresh its summary (incremental — only the edited page regenerates).
