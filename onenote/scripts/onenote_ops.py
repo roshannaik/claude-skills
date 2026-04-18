@@ -44,6 +44,7 @@ from onenote_write import (  # noqa: F401
     get_container_html, set_container_html,
     _patch_page_content, _CONTAINER_RE, _get_body,
 )
+from onenote_embeddings import semantic_search  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -75,6 +76,15 @@ async def main_async(args):
                 print(f"\n  [{i}] ...{snip}...")
             if len(h['snippets']) > 3:
                 print(f"\n  ... and {len(h['snippets']) - 3} more occurrence(s)")
+        return
+
+    if args.cmd == 'semantic-search':
+        hits = semantic_search(args.query, top_k=args.top_k, notebook=args.notebook)
+        if not hits:
+            print('No results.')
+            return
+        for h in hits:
+            print(f"{h['score']:.3f}  {h['title']}  |  {h['notebook']} / {h['section']}")
         return
 
     if args.cmd == 'routing-index':
@@ -161,6 +171,14 @@ if __name__ == '__main__':
                    help='Max pages to show (default 0 = all). Use N to cap.')
     p.add_argument('--context', type=int, default=200,
                    help='Characters of context around each match (default 200).')
+
+    p = sub.add_parser('semantic-search',
+                       help='Semantic search across all pages using Voyage embeddings')
+    p.add_argument('query', help='Natural language query')
+    p.add_argument('--top-k', type=int, default=10, dest='top_k',
+                   help='Number of results to return (default 10)')
+    p.add_argument('--notebook', metavar='NOTEBOOK',
+                   help='Restrict search to a single notebook (case-insensitive)')
 
     p = sub.add_parser('routing-index',
                        help='Print compact routing index built from Haiku summaries')
