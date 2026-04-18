@@ -1,18 +1,14 @@
 """OneNote local search (no API calls).
 
-- search_pages  — title grep via page_index.txt
+- search_pages   — title grep via page_index.txt
 - search_content — keyword grep across cached page HTML
-- _build_compact_index — hierarchical routing index from Haiku summaries
-  (kept for now; removed in Phase 5 when Haiku summaries are dropped)
+
+Semantic search lives in onenote_embeddings.semantic_search — prefer it over
+these for anything beyond exact-title / exact-keyword lookups.
 """
-import json
 import re
-from pathlib import Path
 
 from onenote_cache import _load_page_index, PAGE_CONTENT_DIR
-
-SUMMARIES_DIR = Path(__file__).parent.parent / 'cache' / 'summaries'
-_ROUTE_SEC_CHARS = 120
 
 
 def search_pages(query: str, limit: int = None) -> list:
@@ -71,29 +67,3 @@ def search_content(query: str, context_chars: int = 200, limit: int = None) -> l
             hits.append({**meta, 'snippets': snippets})
 
     return hits[:limit] if limit else hits
-
-
-def _build_compact_index(notebooks: list) -> str:
-    """Build compact routing index from .json summary files.
-    Kept for backward compat; removed in Phase 5 with the summaries system."""
-    parts = []
-    for nb_name in notebooks:
-        json_path = SUMMARIES_DIR / f'{nb_name}.json'
-        if not json_path.exists():
-            continue
-        data = json.loads(json_path.read_text())
-        nb_summary = data.get('notebook_summary', '')[:200]
-        parts.append(f'# {nb_name}\n{nb_summary}\n')
-        for sec_name, sec_data in data.get('sections', {}).items():
-            sec_sum = sec_data.get('section_summary', '')
-            sec_short = (sec_sum[:_ROUTE_SEC_CHARS].rsplit(' ', 1)[0]
-                         if len(sec_sum) > _ROUTE_SEC_CHARS else sec_sum)
-            page_titles = [
-                pdata['title'].strip()
-                for pdata in sec_data.get('pages', {}).values()
-                if not pdata.get('summary', '').startswith('[Page is only a title')
-            ]
-            parts.append(f'\n## {sec_name} | {sec_short}')
-            if page_titles:
-                parts.append(f'Pages: {", ".join(page_titles)}')
-    return '\n'.join(parts)

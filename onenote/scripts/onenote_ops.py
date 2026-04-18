@@ -33,7 +33,7 @@ from onenote_cache import (  # noqa: F401
     strip_html,
 )
 from onenote_search import (  # noqa: F401
-    SUMMARIES_DIR, search_pages, search_content, _build_compact_index,
+    search_pages, search_content,
 )
 from onenote_api import (  # noqa: F401
     get_notebooks, get_sections, get_pages, refresh_notebook,
@@ -85,17 +85,6 @@ async def main_async(args):
             return
         for h in hits:
             print(f"{h['score']:.3f}  {h['title']}  |  {h['notebook']} / {h['section']}")
-        return
-
-    if args.cmd == 'routing-index':
-        available = [f.stem for f in sorted(SUMMARIES_DIR.glob('*.json'))]
-        if args.notebook:
-            nb_lower = {n.lower() for n in args.notebook}
-            available = [nb for nb in available if nb.lower() in nb_lower]
-        if not available:
-            print('No summary files found. Build with: python3 build_summaries.py <Notebook>')
-            return
-        print(_build_compact_index(available))
         return
 
     # Remaining commands need the Graph API client
@@ -179,11 +168,6 @@ if __name__ == '__main__':
                    help='Number of results to return (default 10)')
     p.add_argument('--notebook', metavar='NOTEBOOK',
                    help='Restrict search to a single notebook (case-insensitive)')
-
-    p = sub.add_parser('routing-index',
-                       help='Print compact routing index built from Haiku summaries')
-    p.add_argument('--notebook', nargs='+', metavar='NOTEBOOK',
-                   help='Limit to these notebooks (default: all with summaries)')
 
     args = parser.parse_args()
 
