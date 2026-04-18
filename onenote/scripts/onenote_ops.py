@@ -1,423 +1,70 @@
 #!/usr/bin/env python3
-"""
-OneNote operations via Microsoft Graph API.
-Requires: ~/.claude/skills/onenote/scripts/onenote_setup.py (auth helper + Graph client)
-Token cache: ~/.cache/ms_graph_token_cache.json (no login needed after first setup)
+"""OneNote CLI entry point + UNIX-socket daemon.
 
-Performance design:
-- Daemon mode (--serve): long-running async UNIX socket server, idles for 6 hours.
-  All CLI calls check for a running daemon first; if found, delegate over socket
-  (no Python startup or import cost). If not found, start daemon in background and
-  run this call in-process (daemon ready for next call).
-- In-memory JSON cache with mtime check: daemon never re-reads disk unless file changed.
-- Heavy imports (msgraph, msal) deferred until first API call — cache/search ops are fast.
-- Page content cached per page_id, invalidated by last_modified from Graph API.
-- Parallel section/page fetches via asyncio.gather() on refresh.
+The heavy lifting now lives in sibling modules:
+  - onenote_cache   — JSON cache, page index, content cache, update helpers
+  - onenote_api     — Graph API read ops (get_notebooks, find_page, refresh_*)
+  - onenote_write   — update_page, create_page, container helpers
+  - onenote_search  — title / content grep, routing index
+
+This file keeps: daemon (removed in Phase 2), prepopulate (removed in Phase 2),
+and the argparse CLI dispatch. All names below are re-exported for backward
+compat with inline-Python usage (`from onenote_ops import find_page, ...`).
 """
-import asyncio, sys, os, re, json, time, argparse, warnings, signal, urllib.request
+import asyncio, sys, os, json, time, argparse, warnings, signal
 warnings.filterwarnings('ignore', category=Warning, module='urllib3')
 from pathlib import Path
-from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-REFS_DIR         = Path(__file__).parent.parent / 'cache'
-CACHE_JSON       = REFS_DIR / 'onenote_cache.json'
-PAGE_INDEX       = REFS_DIR / 'page_index.txt'
-PAGE_CONTENT_DIR = REFS_DIR / 'page_content'
-PAGE_CONTENT_DIR.mkdir(parents=True, exist_ok=True)  # ensure exists at import time
-DAEMON_SOCK      = Path('/tmp/onenote_ops.sock')
-DAEMON_PID       = Path('/tmp/onenote_ops.pid')
-IDLE_TIMEOUT     = 6 * 3600  # seconds
-
 # ---------------------------------------------------------------------------
-# JSON cache — with in-memory mtime cache for daemon efficiency
+# Re-exports for backward compatibility
 # ---------------------------------------------------------------------------
 
-_mem_cache: dict = {}
-_mem_cache_mtime: float = 0.0
+from onenote_cache import (  # noqa: F401
+    REFS_DIR, CACHE_JSON, PAGE_INDEX, PAGE_CONTENT_DIR,
+    _load_cache, _save_cache, _rebuild_page_index,
+    _load_page_index,
+    lookup_notebook, lookup_section, lookup_page,
+    _content_path, load_content_cache, save_content_cache,
+    update_sections_cache, update_pages_cache,
+    strip_html,
+)
+from onenote_search import (  # noqa: F401
+    SUMMARIES_DIR, search_pages, search_content, _build_compact_index,
+)
+from onenote_api import (  # noqa: F401
+    get_notebooks, get_sections, get_pages, refresh_notebook,
+    find_page, find_pages_batch, refresh_all_notebooks,
+)
+from onenote_write import (  # noqa: F401
+    update_page, create_page,
+    get_container_html, set_container_html,
+    _patch_page_content, _CONTAINER_RE, _get_body,
+)
 
-def _load_cache() -> dict:
-    """Load JSON cache. In daemon mode, only re-reads disk when file has changed."""
-    global _mem_cache, _mem_cache_mtime
-    try:
-        mtime = CACHE_JSON.stat().st_mtime if CACHE_JSON.exists() else 0.0
-    except OSError:
-        mtime = 0.0
-    if mtime > _mem_cache_mtime:
-        _mem_cache = json.loads(CACHE_JSON.read_text()) if CACHE_JSON.exists() else {}
-        _mem_cache_mtime = mtime
-    return _mem_cache
-
-def _save_cache(cache: dict) -> None:
-    global _mem_cache, _mem_cache_mtime
-    cache['_meta'] = {'last_updated': datetime.now().strftime('%Y-%m-%d')}
-    CACHE_JSON.write_text(json.dumps(cache, separators=(',', ':')))
-    _mem_cache = cache
-    _mem_cache_mtime = CACHE_JSON.stat().st_mtime
-    _rebuild_page_index(cache)
-
-def _rebuild_page_index(cache: dict) -> None:
-    """Write page_index.txt: tab-separated title\\tnotebook\\tsection\\tpage_id"""
-    lines = []
-    for nb_name, nb_data in cache.items():
-        if nb_name.startswith('_'):
-            continue
-        for sec_name, sec_data in nb_data.get('sections', {}).items():
-            for page in sec_data.get('pages', []):
-                title   = page['title'] if isinstance(page, dict) else page
-                page_id = page.get('id', '') if isinstance(page, dict) else ''
-                lines.append(f"{title}\t{nb_name}\t{sec_name}\t{page_id}")
-    PAGE_INDEX.write_text('\n'.join(lines) + '\n')
+DAEMON_SOCK  = Path('/tmp/onenote_ops.sock')
+DAEMON_PID   = Path('/tmp/onenote_ops.pid')
+IDLE_TIMEOUT = 6 * 3600
 
 # ---------------------------------------------------------------------------
-# Cache lookup helpers — no API, no heavy imports
-# ---------------------------------------------------------------------------
-
-def lookup_notebook(name: str) -> dict:
-    cache = _load_cache()
-    return next((v for k, v in cache.items()
-                 if not k.startswith('_') and k.lower() == name.lower()), None)
-
-def lookup_section(notebook: str, section: str) -> dict:
-    nb = lookup_notebook(notebook)
-    if not nb:
-        return None
-    return next((v for k, v in nb.get('sections', {}).items()
-                 if k.lower() == section.lower()), None)
-
-def lookup_page(notebook: str, section: str, title: str) -> dict:
-    sec = lookup_section(notebook, section)
-    if not sec:
-        return None
-    for page in sec.get('pages', []):
-        t = page['title'] if isinstance(page, dict) else page
-        if t.lower() == title.lower():
-            return page if isinstance(page, dict) else {'title': t, 'id': '', 'last_modified': ''}
-    return None
-
-_page_index_cache: list = []
-_page_index_mtime: float = 0.0
-
-def _load_page_index() -> list:
-    """Load page_index.txt into memory, re-reading only when file changes."""
-    global _page_index_cache, _page_index_mtime
-    try:
-        mtime = PAGE_INDEX.stat().st_mtime if PAGE_INDEX.exists() else 0.0
-    except OSError:
-        mtime = 0.0
-    if mtime > _page_index_mtime:
-        if PAGE_INDEX.exists():
-            lines = PAGE_INDEX.read_text().splitlines()
-            _page_index_cache = [ln.split('\t') for ln in lines if ln.strip()]
-        else:
-            _page_index_cache = []
-        _page_index_mtime = mtime
-    return _page_index_cache
-
-SUMMARIES_DIR = Path(__file__).parent.parent / 'cache' / 'summaries'
-
-_ROUTE_SEC_CHARS = 120  # chars of section summary to include in routing index
-
-
-def _build_compact_index(notebooks: list) -> str:
-    """Build a compact routing index from .json summary files.
-
-    Format per section:
-      ## Section | <section summary snippet>
-      Pages: Title1, Title2, Title3...
-
-    Skips stub (empty) pages. ~2-3K tokens — sized to fit inline in agent context.
-    """
-    parts = []
-    for nb_name in notebooks:
-        json_path = SUMMARIES_DIR / f'{nb_name}.json'
-        if not json_path.exists():
-            continue
-        data = json.loads(json_path.read_text())
-        nb_summary = data.get('notebook_summary', '')[:200]
-        parts.append(f'# {nb_name}\n{nb_summary}\n')
-        for sec_name, sec_data in data.get('sections', {}).items():
-            sec_sum = sec_data.get('section_summary', '')
-            sec_short = (sec_sum[:_ROUTE_SEC_CHARS].rsplit(' ', 1)[0]
-                         if len(sec_sum) > _ROUTE_SEC_CHARS else sec_sum)
-            page_titles = [
-                pdata['title'].strip()
-                for pdata in sec_data.get('pages', {}).values()
-                if not pdata.get('summary', '').startswith('[Page is only a title')
-            ]
-            parts.append(f'\n## {sec_name} | {sec_short}')
-            if page_titles:
-                parts.append(f'Pages: {", ".join(page_titles)}')
-    return '\n'.join(parts)
-
-
-def search_pages(query: str, limit: int = None) -> list:
-    """Search page_index.txt in-process (no subprocess). Fast — no API, no heavy imports.
-    limit=None returns all matches; pass an int to cap results."""
-    q = query.lower()
-    hits = []
-    for parts in _load_page_index():
-        if len(parts) >= 3 and q in parts[0].lower():
-            hits.append({'title': parts[0], 'notebook': parts[1], 'section': parts[2],
-                         'id': parts[3] if len(parts) > 3 else ''})
-    return hits[:limit] if limit else hits
-
-
-def search_content(query: str, context_chars: int = 200, limit: int = None) -> list:
-    """Search cached page HTML files for query string. No API calls — offline only.
-    Returns list of dicts: {title, notebook, section, id, snippets: [str]}.
-    Only pages already in the content cache are searched."""
-    import re
-    q = query.lower()
-    # Build id->metadata map from page index
-    id_meta = {}
-    for parts in _load_page_index():
-        if len(parts) >= 4:
-            id_meta[parts[3]] = {'title': parts[0], 'notebook': parts[1], 'section': parts[2]}
-
-    hits = []
-    for html_file in sorted(PAGE_CONTENT_DIR.glob('*.html')):
-        page_id_safe = html_file.stem
-        # Reverse the safe encoding: _ back to ! (best-effort — just for lookup)
-        page_id_candidates = [page_id_safe.replace('_', '!', 2)]
-        meta = None
-        for pid in page_id_candidates:
-            if pid in id_meta:
-                meta = id_meta[pid]
-                break
-        if meta is None:
-            # Try direct stem match against known ids
-            for pid, m in id_meta.items():
-                safe = pid.replace('!', '_').replace('/', '_')
-                if safe == page_id_safe:
-                    meta = m
-                    break
-        if meta is None:
-            continue
-
-        text = re.sub(r'<[^>]+>', ' ', html_file.read_text())
-        text = re.sub(r'\s+', ' ', text)
-        text_lower = text.lower()
-
-        snippets = []
-        idx = 0
-        while True:
-            i = text_lower.find(q, idx)
-            if i == -1:
-                break
-            start = max(0, i - context_chars // 2)
-            end = min(len(text), i + len(q) + context_chars // 2)
-            snippets.append(text[start:end].strip())
-            idx = i + 1
-
-        if snippets:
-            hits.append({**meta, 'snippets': snippets})
-
-    return hits[:limit] if limit else hits
-
-# ---------------------------------------------------------------------------
-# Page content cache — keyed by page_id, invalidated by last_modified
-# ---------------------------------------------------------------------------
-
-def _content_path(page_id: str) -> Path:
-    safe = page_id.replace('!', '_').replace('/', '_')
-    return PAGE_CONTENT_DIR / f'{safe}.html'
-
-def load_content_cache(page_id: str, expected_modified: str) -> str:
-    if not expected_modified or not page_id:
-        return None
-    p = _content_path(page_id)
-    meta = p.with_suffix('.meta')
-    if p.exists() and meta.exists() and meta.read_text().strip() == expected_modified.strip():
-        return p.read_text()
-    return None
-
-def save_content_cache(page_id: str, html: str, last_modified: str) -> None:
-    p = _content_path(page_id)
-    p.write_text(html)
-    if last_modified:
-        p.with_suffix('.meta').write_text(last_modified)
-
-# ---------------------------------------------------------------------------
-# Cache update helpers — called after API fetches
-# ---------------------------------------------------------------------------
-
-def update_sections_cache(notebook_name: str, sections: list, notebook_id: str,
-                           notebook_modified: str = '') -> None:
-    """Update sections cache. Detects renames by matching on section ID."""
-    cache = _load_cache()
-    nb_key = next((k for k in cache if not k.startswith('_')
-                   and k.lower() == notebook_name.lower()), notebook_name)
-    existing_secs = cache.get(nb_key, {}).get('sections', {})
-
-    # Build id→name reverse map of existing cache for rename detection
-    id_to_existing_name = {v['id']: k for k, v in existing_secs.items() if v.get('id')}
-
-    new_secs = {}
-    for s in sections:
-        old_name = id_to_existing_name.get(s['id'])  # None if new section
-        # Carry forward existing pages (rename-safe: keyed by ID match)
-        existing_entry = existing_secs.get(old_name or s['name'], {})
-        new_secs[s['name']] = {
-            'id':            s['id'],
-            'last_modified': s.get('last_modified', ''),
-            'pages':         existing_entry.get('pages', []),
-        }
-
-    cache[nb_key] = {
-        'id':            notebook_id,
-        'last_modified': notebook_modified,
-        'sections':      new_secs,
-    }
-    _save_cache(cache)
-
-
-def update_pages_cache(notebook_name: str, section_name: str, pages: list,
-                        section_modified: str = '') -> None:
-    """Update pages cache. Detects renames by matching on page ID."""
-    cache = _load_cache()
-    nb_key = next((k for k in cache if not k.startswith('_')
-                   and k.lower() == notebook_name.lower()), notebook_name)
-    if nb_key not in cache:
-        cache[nb_key] = {'id': '', 'sections': {}}
-    sec_key = next((k for k in cache[nb_key]['sections']
-                    if k.lower() == section_name.lower()), section_name)
-    if sec_key not in cache[nb_key]['sections']:
-        cache[nb_key]['sections'][sec_key] = {'id': '', 'last_modified': '', 'pages': []}
-
-    # Rename detection: build id→old_title map from cached pages
-    existing_pages = cache[nb_key]['sections'][sec_key].get('pages', [])
-    id_to_old_title = {p['id']: p['title'] for p in existing_pages if p.get('id')}
-
-    new_pages = []
-    for p in pages:
-        old_title = id_to_old_title.get(p['id'])
-        if old_title and old_title != p['title']:
-            pass  # title updated below — rename detected, no special action needed
-        new_pages.append({
-            'title':         p['title'],
-            'id':            p['id'],
-            'last_modified': p.get('last_modified', ''),
-        })
-
-    cache[nb_key]['sections'][sec_key]['pages'] = new_pages
-    if section_modified:
-        cache[nb_key]['sections'][sec_key]['last_modified'] = section_modified
-    _save_cache(cache)
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def strip_html(html: str) -> str:
-    text = re.sub(r'<[^>]+>', ' ', html)
-    return re.sub(r'\s+', ' ', text).strip()
-
-# ---------------------------------------------------------------------------
-# API operations — heavy imports deferred until first call
-# ---------------------------------------------------------------------------
-
-async def get_notebooks(client=None):
-    from onenote_setup import make_graph_client, list_notebooks
-    if client is None:
-        client = make_graph_client()
-    return await list_notebooks(client)
-
-async def get_sections(client, notebook_name: str) -> list:
-    """Fetch sections. Uses cached notebook ID and last_modified to skip re-fetch when unchanged."""
-    from onenote_setup import list_sections, list_notebooks, get_notebook_modified
-    nb = lookup_notebook(notebook_name)
-
-    if nb and nb.get('id'):
-        nb_id = nb['id']
-        # Freshness check: lightweight single-item fetch
-        if nb.get('last_modified') and nb.get('sections'):
-            current_mod = await get_notebook_modified(client, nb_id)
-            if current_mod == nb['last_modified']:
-                # Cache is fresh — return sections without re-fetching
-                return [{'id': v['id'], 'name': k, 'last_modified': v.get('last_modified', '')}
-                        for k, v in nb['sections'].items()]
-    else:
-        notebooks = await list_notebooks(client)
-        nb_data = next((n for n in notebooks if n['name'].lower() == notebook_name.lower()), None)
-        if not nb_data:
-            raise ValueError(f"Notebook '{notebook_name}' not found.")
-        nb_id = nb_data['id']
-
-    sections = await list_sections(client, nb_id)
-    nb_mod = nb.get('last_modified', '') if nb else ''
-    # Get fresh notebook last_modified if we didn't already fetch it
-    if not nb_mod:
-        try:
-            nb_mod = await get_notebook_modified(client, nb_id)
-        except Exception:
-            pass
-    update_sections_cache(notebook_name, sections, nb_id, notebook_modified=nb_mod)
-    return sections
-
-
-async def get_pages(client, notebook_name: str, section_name: str) -> list:
-    """Fetch pages. Uses cached section last_modified to skip re-fetch when unchanged."""
-    from onenote_setup import list_pages, get_section_modified
-    sec = lookup_section(notebook_name, section_name)
-
-    if sec and sec.get('id'):
-        sec_id = sec['id']
-        # Freshness check: lightweight single-item fetch
-        if sec.get('last_modified') and sec.get('pages'):
-            current_mod = await get_section_modified(client, sec_id)
-            if current_mod == sec['last_modified']:
-                # Cache is fresh — return pages without re-fetching
-                return sec['pages']
-    else:
-        sections = await get_sections(client, notebook_name)
-        sec_data = next((s for s in sections if s['name'].lower() == section_name.lower()), None)
-        if not sec_data:
-            raise ValueError(f"Section '{section_name}' not found in '{notebook_name}'.")
-        sec_id = sec_data['id']
-
-    pages = await list_pages(client, sec_id)
-    # Fetch current section last_modified to store for next freshness check
-    try:
-        sec_mod = await get_section_modified(client, sec_id)
-    except Exception:
-        sec_mod = ''
-    update_pages_cache(notebook_name, section_name, pages, section_modified=sec_mod)
-    return pages
-
-async def refresh_notebook(client, notebook_name: str) -> dict:
-    """Refresh all sections + all pages in parallel via asyncio.gather()."""
-    from onenote_setup import list_pages
-    sections = await get_sections(client, notebook_name)
-
-    async def _fetch(sec):
-        pages = await list_pages(client, sec['id'])
-        update_pages_cache(notebook_name, sec['name'], pages)
-        return len(pages)
-
-    counts = await asyncio.gather(*[_fetch(s) for s in sections])
-    return {'sections': len(sections), 'pages': sum(counts)}
-
-# ---------------------------------------------------------------------------
-# Background page-ID pre-population
+# Background page-ID pre-population (removed in Phase 2)
 # ---------------------------------------------------------------------------
 
 PREPOP_CONCURRENCY = 8
 _PREPOP_LOG        = Path('/tmp/onenote_prepop.log')
 _PREPOP_STATUS     = Path('/tmp/onenote_prepop_status.json')
-_prepop_cancel     = False   # set by signal handler to abort gracefully
+_prepop_cancel     = False
 
 
 async def _fetch_section_with_retry(client, nb_name: str, sec_name: str,
                                      sec_id: str, cached_mod: str,
                                      max_retries: int = 4) -> tuple:
-    """Fetch + cache pages for one section. Returns (page_count, status_str).
-    Retries on 429 with exponential backoff: 2s, 4s, 8s, 16s (max 60s)."""
+    """Fetch + cache pages for one section. Returns (page_count, status_str)."""
     from onenote_setup import list_pages, get_section_modified
     for attempt in range(max_retries):
         try:
-            pages   = await list_pages(client, sec_id)
+            pages = await list_pages(client, sec_id)
             try:
                 sec_mod = await get_section_modified(client, sec_id)
             except Exception:
@@ -427,7 +74,7 @@ async def _fetch_section_with_retry(client, nb_name: str, sec_name: str,
         except Exception as e:
             msg = str(e)
             if '429' in msg or 'throttl' in msg.lower() or 'TooManyRequests' in msg:
-                wait = min(2 * (2 ** attempt), 60)   # 2, 4, 8, 16 … 60 s
+                wait = min(2 * (2 ** attempt), 60)
                 await asyncio.sleep(wait)
             else:
                 return 0, f'err:{msg[:80]}'
@@ -436,17 +83,7 @@ async def _fetch_section_with_retry(client, nb_name: str, sec_name: str,
 
 async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENCY,
                                 log_file: Path = None) -> dict:
-    """
-    Pre-populate page IDs for all sections in the local cache.
-
-    Design:
-    - Skips sections where every cached page already has an ID (safe to re-run)
-    - Concurrency=8 (proven safe for personal Graph accounts, no 429s in probe)
-    - Retries 429/throttle with exponential backoff, up to 4 attempts per section
-    - Writes cache incrementally — crash or SIGTERM loses only the in-flight batch
-    - Live progress: \\r updates to stderr (foreground) or log_file (daemon)
-    - Machine-readable status written to /tmp/onenote_prepop_status.json
-    """
+    """Pre-populate page IDs for all sections in the local cache."""
     global _prepop_cancel
     _prepop_cancel = False
 
@@ -454,7 +91,6 @@ async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENC
     if client is None:
         client = make_graph_client()
 
-    # Build work list — skip sections already fully populated
     cache = _load_cache()
     work, skip_count = [], 0
     for nb_name, nb_data in cache.items():
@@ -470,23 +106,20 @@ async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENC
                 continue
             work.append((nb_name, sec_name, sec_id, sec_data.get('last_modified', '')))
 
-    total       = len(work)
-    done        = 0
-    errors      = 0
-    total_pages = 0
-    t_start     = time.perf_counter()
-    sem         = asyncio.Semaphore(concurrency)
+    total, done, errors, total_pages = len(work), 0, 0, 0
+    t_start = time.perf_counter()
+    sem = asyncio.Semaphore(concurrency)
 
     def _write_progress():
         elapsed = max(time.perf_counter() - t_start, 0.001)
-        rate    = done / elapsed
-        pct     = done / total if total else 1.0
-        bar_w   = 24
-        filled  = int(bar_w * pct)
-        bar     = ('=' * filled + ('>' if filled < bar_w else '') +
-                   ' ' * max(bar_w - filled - 1, 0))
-        line    = (f"prepop [{bar}] {done}/{total} secs "
-                   f"| {rate:.1f}/s | skip={skip_count} err={errors} pages={total_pages}")
+        rate = done / elapsed
+        pct = done / total if total else 1.0
+        bar_w = 24
+        filled = int(bar_w * pct)
+        bar = ('=' * filled + ('>' if filled < bar_w else '') +
+               ' ' * max(bar_w - filled - 1, 0))
+        line = (f"prepop [{bar}] {done}/{total} secs "
+                f"| {rate:.1f}/s | skip={skip_count} err={errors} pages={total_pages}")
         if log_file:
             Path(log_file).write_text(line + '\n')
         else:
@@ -510,22 +143,21 @@ async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENC
                 return
             count, status = await _fetch_section_with_retry(
                 client, nb_name, sec_name, sec_id, cached_mod)
-            done        += 1
+            done += 1
             total_pages += count
             if status != 'ok':
                 errors += 1
             _write_progress()
 
-    # Register signal handlers for graceful shutdown (asyncio-safe)
     loop = asyncio.get_event_loop()
     def _on_cancel():
         global _prepop_cancel
         _prepop_cancel = True
     try:
         loop.add_signal_handler(signal.SIGTERM, _on_cancel)
-        loop.add_signal_handler(signal.SIGINT,  _on_cancel)
+        loop.add_signal_handler(signal.SIGINT, _on_cancel)
     except (NotImplementedError, RuntimeError):
-        pass  # non-Unix or already in signal handler context
+        pass
 
     _write_progress()
     tasks = [asyncio.create_task(_worker(*args)) for args in work]
@@ -537,10 +169,10 @@ async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENC
             t.cancel()
 
     if not log_file:
-        print('', file=sys.stderr)  # newline after final \r
+        print('', file=sys.stderr)
 
     elapsed = time.perf_counter() - t_start
-    result  = {
+    result = {
         'done': done, 'total': total, 'skip': skip_count,
         'errors': errors, 'pages': total_pages,
         'elapsed': round(elapsed, 1), 'cancelled': _prepop_cancel,
@@ -560,7 +192,7 @@ async def prepopulate_page_ids(client=None, concurrency: int = PREPOP_CONCURRENC
 
 async def _background_prepopulate() -> None:
     """Daemon background task: pre-populate page IDs 5 s after daemon start."""
-    await asyncio.sleep(5)   # let daemon fully settle first
+    await asyncio.sleep(5)
     try:
         from onenote_setup import make_graph_client
         client = make_graph_client()
@@ -574,156 +206,15 @@ async def _background_prepopulate() -> None:
             pass
 
 
-async def find_page(client, notebook_name: str, section_name: str, page_title: str) -> dict:
-    """Find a page and return its content.
-
-    Fast path  (0 API calls): page ID cached + content fresh.
-    Medium path (1 API call): page ID cached, content stale/missing.
-    Slow path  (2+ API calls): page ID not cached, fetches via API.
-    """
-    from onenote_setup import get_page_content
-    cached = lookup_page(notebook_name, section_name, page_title)
-
-    if cached and cached.get('id'):
-        page_id  = cached['id']
-        last_mod = cached.get('last_modified', '')
-        html = load_content_cache(page_id, last_mod)
-        if html is None:
-            html = await get_page_content(client, page_id)
-            save_content_cache(page_id, html, last_mod)
-        return {'id': page_id, 'title': page_title, 'content': strip_html(html), 'html': html}
-
-    pages = await get_pages(client, notebook_name, section_name)
-    page  = next((p for p in pages if p['title'].lower() == page_title.lower()), None)
-    if not page:
-        raise ValueError(f"Page '{page_title}' not found in {notebook_name}/{section_name}. "
-                         f"Available: {[p['title'] for p in pages]}")
-    html = load_content_cache(page['id'], page.get('last_modified', ''))
-    if html is None:
-        html = await get_page_content(client, page['id'])
-        save_content_cache(page['id'], html, page.get('last_modified', ''))
-    return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
-
-async def find_pages_batch(client, page_specs: list[dict]) -> list[dict]:
-    """Fetch multiple pages in parallel.
-
-    page_specs = [{'notebook': ..., 'section': ..., 'page': ...}, ...]
-    Returns list of {id, title, content, html} dicts.
-    Failed pages include an 'error' key instead of content.
-    """
-    async def _fetch(spec):
-        try:
-            return await find_page(client, spec['notebook'], spec['section'], spec['page'])
-        except Exception as e:
-            return {'title': spec.get('page', ''), 'content': '', 'html': '', 'error': str(e)}
-    return list(await asyncio.gather(*[_fetch(s) for s in page_specs]))
-
-
-async def refresh_all_notebooks(client) -> dict:
-    """Refresh all notebooks in parallel.
-
-    Returns {notebook_name: {'sections': N, 'pages': N}} for each notebook.
-    """
-    cache = _load_cache()
-    notebooks = [k for k in cache if not k.startswith('_')]
-
-    async def _refresh(nb_name):
-        try:
-            result = await refresh_notebook(client, nb_name)
-            return nb_name, result
-        except Exception as e:
-            return nb_name, {'error': str(e)}
-
-    results = await asyncio.gather(*[_refresh(nb) for nb in notebooks])
-    return dict(results)
-
-
-def _patch_page_content(page_id: str, patch_body: list) -> None:
-    """Send a PATCH request to the OneNote page content endpoint."""
-    from onenote_setup import get_access_token
-    token = get_access_token()
-    url = f'https://graph.microsoft.com/v1.0/me/onenote/pages/{page_id}/content'
-    data = json.dumps(patch_body).encode('utf-8')
-    req = urllib.request.Request(
-        url, data=data,
-        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-        method='PATCH',
-    )
-    with urllib.request.urlopen(req):
-        pass
-
-
-async def update_page(client, page_id: str, new_html_content: str):
-    """Replace the entire body of a OneNote page."""
-    _patch_page_content(page_id, [{"target": "body", "action": "replace", "content": new_html_content}])
-
-
-_CONTAINER_RE = re.compile(
-    r'(<div\b[^>]*style="[^"]*position:absolute[^"]*"[^>]*>)(.*?)(</div>)',
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _get_body(html: str) -> str:
-    m = re.search(r'<body[^>]*>(.*)</body>', html, re.DOTALL | re.IGNORECASE)
-    if not m:
-        raise ValueError("Could not parse page body.")
-    return m.group(1)
-
-
-def get_container_html(html: str) -> str:
-    """Return the inner HTML of the single note container in a page.
-
-    Raises ValueError if the page has zero or multiple note containers.
-    Use this to read the container before deciding where to insert new content.
-    """
-    matches = _CONTAINER_RE.findall(_get_body(html))
-    if len(matches) == 0:
-        raise ValueError("Page has no note containers.")
-    if len(matches) > 1:
-        raise ValueError(
-            f"Page has {len(matches)} note containers — only single-container pages are supported."
-        )
-    return matches[0][1]  # group 2: inner HTML
-
-
-def set_container_html(html: str, new_inner: str) -> str:
-    """Return the page body HTML with the single container's inner HTML replaced by new_inner.
-
-    The return value is the body content ready to pass directly to update_page().
-    Raises ValueError if the page has zero or multiple note containers.
-    """
-    body = _get_body(html)
-    matches = list(_CONTAINER_RE.finditer(body))
-    if len(matches) == 0:
-        raise ValueError("Page has no note containers.")
-    if len(matches) > 1:
-        raise ValueError(
-            f"Page has {len(matches)} note containers — only single-container pages are supported."
-        )
-    m = matches[0]
-    return body[:m.start(2)] + new_inner + body[m.end(2):]
-
-
-async def create_page(client, section_id: str, title: str, html_body: str):
-    html = f"""<!DOCTYPE html>
-<html><head><title>{title}</title></head>
-<body>{html_body}</body></html>"""
-    return await client.post(
-        f"/me/onenote/sections/{section_id}/pages",
-        data=html.encode('utf-8'),
-        headers={"Content-Type": "text/html"}
-    )
-
 # ---------------------------------------------------------------------------
-# Daemon — async UNIX socket server, 6-hour idle shutdown
+# Daemon — async UNIX socket server (removed in Phase 2)
 # ---------------------------------------------------------------------------
 
 _daemon_last_active: float = 0.0
 
 
 async def _daemon_dispatch(req: dict) -> list:
-    """Route a daemon request to the appropriate function. Returns list of output lines."""
+    """Route a daemon request to the appropriate function."""
     cmd = req.get('cmd')
 
     if cmd == 'search':
@@ -737,8 +228,6 @@ async def _daemon_dispatch(req: dict) -> list:
             lines.insert(0, f"[{len(all_hits)} matches — showing {len(hits)}, use --limit N for more]")
         return lines or ['No results.']
 
-    # Remaining commands need an API client — import lazily so token cost
-    # is only paid when an actual API call is required
     from onenote_setup import make_graph_client
     client = make_graph_client()
 
@@ -779,9 +268,9 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
     _daemon_last_active = time.time()
     try:
         line = await reader.readline()
-        req  = json.loads(line.decode().strip())
+        req = json.loads(line.decode().strip())
         lines = await _daemon_dispatch(req)
-        resp  = json.dumps({'status': 'ok', 'lines': lines}) + '\n'
+        resp = json.dumps({'status': 'ok', 'lines': lines}) + '\n'
     except Exception as e:
         resp = json.dumps({'status': 'error', 'message': str(e)}) + '\n'
     writer.write(resp.encode())
@@ -792,7 +281,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 async def _idle_watchdog(server: asyncio.AbstractServer) -> None:
     while True:
-        await asyncio.sleep(300)  # check every 5 minutes
+        await asyncio.sleep(300)
         if time.time() - _daemon_last_active > IDLE_TIMEOUT:
             print(f"Daemon idle for {IDLE_TIMEOUT//3600}h — shutting down.", file=sys.stderr)
             server.close()
@@ -804,11 +293,9 @@ async def _idle_watchdog(server: asyncio.AbstractServer) -> None:
 
 
 def run_daemon() -> None:
-    """Start the UNIX socket daemon. Called when --serve is passed."""
     global _daemon_last_active
     _daemon_last_active = time.time()
 
-    # Clean up stale socket
     if DAEMON_SOCK.exists():
         DAEMON_SOCK.unlink()
 
@@ -830,10 +317,6 @@ def run_daemon() -> None:
                 p.unlink()
 
 
-# ---------------------------------------------------------------------------
-# Daemon client — called from CLI when daemon is running
-# ---------------------------------------------------------------------------
-
 def _daemon_running() -> bool:
     if not DAEMON_PID.exists() or not DAEMON_SOCK.exists():
         return False
@@ -846,7 +329,6 @@ def _daemon_running() -> bool:
 
 
 def _start_daemon_bg() -> None:
-    """Start the daemon as a detached background process."""
     import subprocess
     subprocess.Popen(
         [sys.executable, __file__, '--serve'],
@@ -857,10 +339,8 @@ def _start_daemon_bg() -> None:
 
 
 def _call_daemon(request: dict) -> list:
-    """Send a request to the running daemon and return output lines."""
     import socket as _socket
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    # Retry briefly in case daemon just started
     for attempt in range(10):
         try:
             sock.connect(str(DAEMON_SOCK))
@@ -893,7 +373,6 @@ async def main_async(args):
     cmd_map = {k: v for k, v in vars(args).items() if k != 'cmd' and v is not None}
     cmd_map['cmd'] = args.cmd
 
-    # search can run without daemon (fast anyway — no API)
     if args.cmd == 'search':
         limit = args.limit if args.limit > 0 else None
         all_hits = search_pages(args.query)
@@ -933,16 +412,14 @@ async def main_async(args):
         print(_build_compact_index(available))
         return
 
-    # Try daemon for all other commands
     if _daemon_running():
         try:
             for line in _call_daemon(cmd_map):
                 print(line)
             return
         except Exception:
-            pass  # Fall through to direct execution if daemon fails
+            pass
 
-    # Start daemon for next call, run this one directly
     if not _daemon_running():
         _start_daemon_bg()
 
