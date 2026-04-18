@@ -157,6 +157,23 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
     new_page_meta: dict = {}
     t0 = time.time()
 
+    def _embed_with_retry(texts, max_attempts=8):
+        """Call Voyage with exponential backoff on 429/rate-limit errors."""
+        for attempt in range(max_attempts):
+            try:
+                return vo.embed(texts, model=MODEL, input_type='document', truncation=True)
+            except Exception as e:
+                msg = str(e)
+                is_rate = ('rate' in msg.lower() or 'RateLimit' in msg
+                           or '429' in msg or 'throttl' in msg.lower())
+                if is_rate and attempt < max_attempts - 1:
+                    wait = min(60, 4 * (2 ** attempt))   # 4, 8, 16, 32, 60, 60, 60 s
+                    print(f"  ! rate limited; sleeping {wait}s (attempt {attempt+1}/{max_attempts})",
+                          file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                raise
+
     i = 0
     total_tokens = 0
     while i < len(to_embed):
@@ -175,16 +192,14 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
         texts = [t for _, t, _ in batch]
 
         try:
-            resp = vo.embed(texts, model=MODEL, input_type='document', truncation=True)
+            resp = _embed_with_retry(texts)
         except Exception as e:
-            # If the batch is too big, halve it and retry
+            # If the batch is too big (token limit, not rate limit), halve and retry
             if len(batch) > 1 and ('token' in str(e).lower() or 'limit' in str(e).lower()):
                 print(f"  ! batch of {len(batch)} rejected ({e}); splitting", file=sys.stderr)
                 mid = len(batch) // 2
-                resp1 = vo.embed([t for _, t, _ in batch[:mid]], model=MODEL,
-                                 input_type='document', truncation=True)
-                resp2 = vo.embed([t for _, t, _ in batch[mid:]], model=MODEL,
-                                 input_type='document', truncation=True)
+                resp1 = _embed_with_retry([t for _, t, _ in batch[:mid]])
+                resp2 = _embed_with_retry([t for _, t, _ in batch[mid:]])
                 embeddings = resp1.embeddings + resp2.embeddings
                 total_tokens += getattr(resp1, 'total_tokens', 0) + getattr(resp2, 'total_tokens', 0)
             else:
