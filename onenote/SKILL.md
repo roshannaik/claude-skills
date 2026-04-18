@@ -183,6 +183,7 @@ When asked "what's in X", list containers first if the page appears to have mult
 
 - **Answer concisely.** Lead with the direct answer to the user's question, then supporting detail only if it adds value. Prefer a short paragraph or a tight table over bulleted dumps. Skip source-page citations unless the user asks where it came from. Skip process narration ("I searched for X, then I read Y…") — the user doesn't need it.
 - **Semantic search first.** For any content question ("where is info about X", "what do my notes say about Y"), start with `semantic-search`. Tier 2/3 are for when the user names an exact page or keyword.
+- **Don't truncate long journal/log pages when searching within them.** When a top-ranked semantic hit is a daily log, treatment log, or any chronological journal-style page (e.g. `Treatment Log`, `Progress`, `Daily Notes`), read the full page — specific details often live deep inside a multi-month entry and will be missed by a default 4K-char slice. Either load the full content (pass `--full` in CLI, or read `p['content']` without slicing in inline Python) or grep within the HTML for the specific keyword. Don't conclude the answer isn't there based on a truncated read.
 - **Never read `onenote_cache.json` directly** — use the CLI.
 - **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages.
 - Both container helpers raise `ValueError` if the page does not have exactly one container.
