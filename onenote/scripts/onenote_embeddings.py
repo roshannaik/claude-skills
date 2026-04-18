@@ -1,4 +1,4 @@
-"""Voyage embeddings for OneNote pages.
+"""Gemini embeddings for OneNote pages.
 
 Builds cache/embeddings.npz (ids + L2-normalized vectors) and
 cache/embeddings_meta.json (model + per-page last_modified for incremental rebuild).
@@ -6,7 +6,11 @@ cache/embeddings_meta.json (model + per-page last_modified for incremental rebui
 Query-time lookup is a single matmul — no vector DB, no ANN index.
 1K pages × 1024-dim float32 = ~4MB total.
 
-Requires VOYAGE_API_KEY environment variable.
+Requires GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable.
+
+Uses gemini-embedding-001 with Matryoshka truncation to 1024 dims (default is 3072).
+1024 is the sweet spot: still near-state-of-the-art quality per Google's published
+MRL results, while keeping storage small and query math fast.
 """
 import json
 import os
@@ -16,18 +20,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from onenote_cache import (
-    _load_cache, REFS_DIR, PAGE_CONTENT_DIR, strip_html,
-    load_content_cache,
+    _load_cache, REFS_DIR, strip_html, load_content_cache,
 )
 
 EMBEDDINGS_NPZ  = REFS_DIR / 'embeddings.npz'
 EMBEDDINGS_META = REFS_DIR / 'embeddings_meta.json'
 
-MODEL            = 'voyage-3'
-EMBED_DIM        = 1024
-MAX_CHARS        = 32000          # per-page cap before sending to Voyage
-BATCH_SIZE       = 64             # texts per Voyage API call
-MAX_BATCH_TOKENS = 900_000        # voyage-3 limit is 1M tokens/batch; leave headroom
+MODEL            = 'gemini-embedding-001'
+EMBED_DIM        = 1024           # MRL-truncated from 3072
+MAX_CHARS        = 32000          # per-page cap before sending to the API
+BATCH_SIZE       = 100            # Gemini embed_content accepts up to 100 texts per call
+
+TASK_DOCUMENT = 'RETRIEVAL_DOCUMENT'
+TASK_QUERY    = 'RETRIEVAL_QUERY'
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +56,35 @@ def _load_vectors() -> tuple:
     return ids, {pid: vecs[i] for i, pid in enumerate(ids)}
 
 
+def _get_client():
+    from google import genai
+    api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+    if not api_key:
+        raise SystemExit('GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set.')
+    return genai.Client(api_key=api_key)
+
+
+def _embed_call(client, texts: list, task_type: str):
+    """Single Gemini embed_content call. Returns list of float lists."""
+    from google.genai import types
+    resp = client.models.embed_content(
+        model=MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(
+            task_type=task_type,
+            output_dimensionality=EMBED_DIM,
+        ),
+    )
+    return [e.values for e in resp.embeddings]
+
+
 # ---------------------------------------------------------------------------
 # Building embedding text per page
 # ---------------------------------------------------------------------------
 
 def _page_text(notebook: str, section: str, title: str, html: str) -> str:
-    """Shape the text fed to Voyage. Header adds routing signal (notebook/section)
-    in case the body is sparse."""
+    """Shape the text fed to the embedding model. Header adds routing signal
+    (notebook/section) in case the body is sparse."""
     body = strip_html(html)
     header = f"Notebook: {notebook}\nSection: {section}\nTitle: {title}\n\n"
     combined = header + body
@@ -88,20 +115,14 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
     """Build or incrementally update embeddings.
 
     - Skips pages whose last_modified matches existing meta (unless force=True).
-    - Skips pages whose HTML is not in the content cache (no API fallback here —
-      run `refresh` or `read-page` to populate content first).
+    - Skips pages whose HTML is not in the content cache.
     - Writes embeddings.npz + embeddings_meta.json atomically at the end.
 
     Returns {'total': N, 'rebuilt': N, 'reused': N, 'skipped_no_content': N, 'elapsed': s}
     """
     import numpy as np
-    import voyageai
 
-    api_key = os.environ.get('VOYAGE_API_KEY')
-    if not api_key:
-        raise SystemExit('VOYAGE_API_KEY environment variable is not set.')
-
-    vo = voyageai.Client(api_key=api_key)
+    client = _get_client()
 
     meta = _load_meta()
     # Invalidate everything if the model changed
@@ -120,7 +141,6 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
 
     for nb, sec, title, pid, lm in _enumerate_pages():
         if notebook_filter and nb not in notebook_filter:
-            # Still carry forward if present
             if pid in existing_vecs:
                 carry.append((pid, existing_vecs[pid]))
             continue
@@ -132,7 +152,6 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
 
         html = load_content_cache(pid, lm)
         if html is None:
-            # No fresh cached HTML — carry forward old embedding if we have one
             if pid in existing_vecs:
                 carry.append((pid, existing_vecs[pid]))
             skipped_no_content += 1
@@ -151,62 +170,43 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
         print("Nothing to embed.", file=sys.stderr)
 
     # ---------------------------------------------------------------------
-    # Call Voyage in batches — respect per-batch token limit, not just count
+    # Call Gemini in batches — fixed BATCH_SIZE, retry rate limits
     # ---------------------------------------------------------------------
-    new_vecs: dict = {}
-    new_page_meta: dict = {}
-    t0 = time.time()
-
     def _embed_with_retry(texts, max_attempts=8):
-        """Call Voyage with exponential backoff on 429/rate-limit errors."""
         for attempt in range(max_attempts):
             try:
-                return vo.embed(texts, model=MODEL, input_type='document', truncation=True)
+                return _embed_call(client, texts, TASK_DOCUMENT)
             except Exception as e:
                 msg = str(e)
-                is_rate = ('rate' in msg.lower() or 'RateLimit' in msg
-                           or '429' in msg or 'throttl' in msg.lower())
+                is_rate = ('rate' in msg.lower() or '429' in msg
+                           or 'quota' in msg.lower() or 'RESOURCE_EXHAUSTED' in msg)
                 if is_rate and attempt < max_attempts - 1:
-                    wait = min(60, 4 * (2 ** attempt))   # 4, 8, 16, 32, 60, 60, 60 s
+                    wait = min(60, 4 * (2 ** attempt))
                     print(f"  ! rate limited; sleeping {wait}s (attempt {attempt+1}/{max_attempts})",
                           file=sys.stderr)
                     time.sleep(wait)
                     continue
                 raise
 
-    i = 0
-    total_tokens = 0
-    while i < len(to_embed):
-        # Build a batch up to BATCH_SIZE texts or MAX_BATCH_TOKENS tokens
-        batch_end = i
-        batch_token_est = 0
-        while batch_end < len(to_embed) and batch_end - i < BATCH_SIZE:
-            # Rough estimate: 1 token ≈ 4 chars
-            est = max(1, len(to_embed[batch_end][1]) // 4)
-            if batch_token_est + est > MAX_BATCH_TOKENS and batch_end > i:
-                break
-            batch_token_est += est
-            batch_end += 1
+    new_vecs: dict = {}
+    new_page_meta: dict = {}
+    t0 = time.time()
 
-        batch = to_embed[i:batch_end]
+    for i in range(0, len(to_embed), BATCH_SIZE):
+        batch = to_embed[i:i + BATCH_SIZE]
         texts = [t for _, t, _ in batch]
-
         try:
-            resp = _embed_with_retry(texts)
+            embeddings = _embed_with_retry(texts)
         except Exception as e:
-            # If the batch is too big (token limit, not rate limit), halve and retry
-            if len(batch) > 1 and ('token' in str(e).lower() or 'limit' in str(e).lower()):
+            # If a batch payload is too big, split in half
+            if len(batch) > 1 and ('payload' in str(e).lower() or 'too large' in str(e).lower()
+                                   or 'INVALID_ARGUMENT' in str(e)):
                 print(f"  ! batch of {len(batch)} rejected ({e}); splitting", file=sys.stderr)
                 mid = len(batch) // 2
-                resp1 = _embed_with_retry([t for _, t, _ in batch[:mid]])
-                resp2 = _embed_with_retry([t for _, t, _ in batch[mid:]])
-                embeddings = resp1.embeddings + resp2.embeddings
-                total_tokens += getattr(resp1, 'total_tokens', 0) + getattr(resp2, 'total_tokens', 0)
+                embeddings = _embed_with_retry([t for _, t, _ in batch[:mid]]) + \
+                             _embed_with_retry([t for _, t, _ in batch[mid:]])
             else:
                 raise
-        else:
-            embeddings = resp.embeddings
-            total_tokens += getattr(resp, 'total_tokens', 0)
 
         for (pid, _, pmeta), vec in zip(batch, embeddings):
             v = np.asarray(vec, dtype=np.float32)
@@ -216,8 +216,8 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
             new_vecs[pid] = v
             new_page_meta[pid] = pmeta
 
-        print(f"  [{batch_end}/{len(to_embed)}] embedded", file=sys.stderr)
-        i = batch_end
+        print(f"  [{min(i + BATCH_SIZE, len(to_embed))}/{len(to_embed)}] embedded",
+              file=sys.stderr)
 
     elapsed = time.time() - t0
 
@@ -227,7 +227,6 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
     final_vecs: dict = {pid: vec for pid, vec in carry}
     final_vecs.update(new_vecs)
 
-    # Preserve meta for carried pages, update for new ones
     final_meta_pages = {
         pid: meta['pages'].get(pid, {}) for pid, _ in carry
     }
@@ -256,7 +255,6 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
         'reused': len(carry),
         'skipped_no_content': skipped_no_content,
         'elapsed': round(elapsed, 1),
-        'tokens': total_tokens,
     }
 
 
@@ -294,11 +292,6 @@ def semantic_search(query: str, top_k: int = 10,
     `notebook` filter restricts to a single notebook name (case-insensitive).
     """
     import numpy as np
-    import voyageai
-
-    api_key = os.environ.get('VOYAGE_API_KEY')
-    if not api_key:
-        raise SystemExit('VOYAGE_API_KEY environment variable is not set.')
 
     ids, vectors = _load_for_query()
     if not ids:
@@ -307,9 +300,9 @@ def semantic_search(query: str, top_k: int = 10,
     meta = _load_meta()
     page_meta = meta.get('pages', {})
 
-    vo = voyageai.Client(api_key=api_key)
-    resp = vo.embed([query], model=MODEL, input_type='query', truncation=True)
-    q = np.asarray(resp.embeddings[0], dtype=np.float32)
+    client = _get_client()
+    vecs = _embed_call(client, [query], TASK_QUERY)
+    q = np.asarray(vecs[0], dtype=np.float32)
     n = np.linalg.norm(q)
     if n > 0:
         q /= n
@@ -317,7 +310,6 @@ def semantic_search(query: str, top_k: int = 10,
     # Cosine since vectors are L2-normalized
     scores = vectors @ q
 
-    # Optional notebook filter: mask out other-notebook scores
     if notebook:
         nb_lower = notebook.lower()
         for idx, pid in enumerate(ids):

@@ -31,11 +31,11 @@ python3 scripts/build_embeddings.py --notebook Health AI
 
 Required env vars:
 - `MS_CLIENT_ID` — Azure app registration (read/write OneNote via Graph)
-- `VOYAGE_API_KEY` — Voyage AI key (semantic search build + query)
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — Google AI Studio key for Gemini embeddings (build + query)
 
 ## Architecture
 
-Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `voyageai`, `numpy`) are deferred to first use so cache-only ops stay snappy.
+Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `google-genai`, `numpy`) are deferred to first use so cache-only ops stay snappy.
 
 | Module | Responsibility |
 |---|---|
@@ -44,7 +44,7 @@ Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `
 | `onenote_api.py` | Graph API read ops — `get_notebooks`, `get_sections`, `get_pages`, `refresh_notebook`, `find_page`, `find_pages_batch`, `refresh_all_notebooks`. Freshness checks via `last_modified` to skip unchanged re-fetches. |
 | `onenote_write.py` | `update_page`, `create_page`, single-container helpers (`get_container_html` / `set_container_html`). |
 | `onenote_search.py` | `search_pages` (title grep) and `search_content` (HTML grep). Pure local, no API. |
-| `onenote_embeddings.py` | Voyage embeddings build + query. Stores `cache/embeddings.npz` (float32, L2-normalized) + `cache/embeddings_meta.json` (model, per-page `last_modified` for incremental rebuilds). Query path: single matmul, no vector DB. |
+| `onenote_embeddings.py` | Gemini embeddings build + query (`gemini-embedding-001`, MRL-truncated to 1024 dims). Stores `cache/embeddings.npz` (float32, L2-normalized) + `cache/embeddings_meta.json` (model, per-page `last_modified` for incremental rebuilds). Query path: single matmul, no vector DB. |
 | `onenote_ops.py` | Thin CLI entry point. Re-exports everything from the above modules for backward compat with inline-Python usage (`from onenote_ops import find_page, ...`). |
 
 `scripts/build_embeddings.py` is a standalone CLI for the embeddings build.
@@ -67,7 +67,7 @@ Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `
 
 ### Harness portability
 
-- No subprocess calls to `claude` anywhere. Summarization uses the Voyage SDK directly, not a Claude CLI.
+- No subprocess calls to `claude` anywhere. Embeddings use the Google GenAI SDK directly, not a Claude CLI.
 - No UNIX daemon, no `/tmp/*.sock` state. Previous design had one — removed to keep behavior identical across harnesses.
 - CLI paths are hardcoded to `~/.claude/skills/onenote/cache/` for now; revisit if another harness needs a different cache root.
 

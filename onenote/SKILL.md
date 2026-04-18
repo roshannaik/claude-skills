@@ -16,11 +16,11 @@ author: clawdi
 - Metadata cache: `~/.claude/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
 - Title index: `~/.claude/skills/onenote/cache/page_index.txt` (page titles + paths)
 - Page content cache: `~/.claude/skills/onenote/cache/page_content/*.html` (keyed by page ID)
-- Embeddings: `~/.claude/skills/onenote/cache/embeddings.npz` (Voyage vectors) + `embeddings_meta.json`
+- Embeddings: `~/.claude/skills/onenote/cache/embeddings.npz` (Gemini vectors, 1024-dim) + `embeddings_meta.json`
 
 **Never read `onenote_cache.json` directly** — use the CLI, which reads it internally.
 
-Requires `VOYAGE_API_KEY` env var for semantic search (get one at voyageai.com). Free tier covers a full rebuild plus thousands of queries.
+Requires `GEMINI_API_KEY` env var for semantic search (get one free at aistudio.google.com/apikey — no credit card needed). Uses `gemini-embedding-001` with MRL truncation to 1024 dims.
 
 ## Search strategies — pick the right tier
 
@@ -28,7 +28,7 @@ Escalate only as needed. Cheaper tiers first.
 
 | Tier | When | Cost | Command |
 |------|------|------|---------|
-| **1. Semantic search** | Natural-language question, conceptual topic, "where is info about X" | 1 Voyage API call (~50 ms, ~100 tokens) | `onenote_ops.py semantic-search "<query>"` |
+| **1. Semantic search** | Natural-language question, conceptual topic, "where is info about X" | 1 Gemini API call (~100 ms) | `onenote_ops.py semantic-search "<query>"` |
 | **2. Title search** | User named a page or you know the exact title | instant, no API | `onenote_ops.py search "<title keyword>"` |
 | **3. Content grep** | Exact keyword in already-cached page HTML | ~100 ms, no API | `onenote_ops.py search-content "<keyword>"` |
 | **4. Full page read** | After routing via any tier above, to get the actual content | 1 API call per page (cached after first fetch) | `onenote_ops.py read-page <nb> <sec> <page>` |
@@ -48,7 +48,7 @@ Output: `score  title  |  notebook / section` — pick the 1-3 most relevant pag
 ### Standard workflow for content questions
 
 ```
-1. semantic-search "<query>"    # ~50 ms, 1 Voyage call, top-K with scores
+1. semantic-search "<query>"    # ~100 ms, 1 Gemini call, top-K with scores
 2. Pick 1-3 target pages from the top results
 3. read-page for each target    # ~instant if cached
 4. Answer from content
@@ -69,7 +69,7 @@ python3 ~/.claude/skills/onenote/scripts/build_embeddings.py --force
 python3 ~/.claude/skills/onenote/scripts/build_embeddings.py --notebook Health AI
 ```
 
-Costs ~1-3M Voyage tokens for the full ~1K-page corpus (well within Voyage's free tier). Pages without cached HTML are skipped — run `refresh` or `read-page` first to populate the content cache.
+Free tier on Google AI Studio (no card required) covers this. Pages without cached HTML are skipped — run `refresh` or `read-page` first to populate the content cache.
 
 ## Read Operations
 
