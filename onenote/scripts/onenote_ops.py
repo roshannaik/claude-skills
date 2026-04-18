@@ -87,9 +87,13 @@ async def main_async(args):
             print(f"{h['score']:.3f}  {h['title']}  |  {h['notebook']} / {h['section']}")
         return
 
-    # Remaining commands need the Graph API client
-    from onenote_setup import make_graph_client
-    client = make_graph_client()
+    # For read-page / read-page-html, skip eager client construction — find_page
+    # lazy-creates a client only on cache miss. All other commands need it.
+    if args.cmd in ('read-page', 'read-page-html'):
+        client = None
+    else:
+        from onenote_setup import make_graph_client
+        client = make_graph_client()
 
     if args.cmd == 'list-notebooks':
         for n in await get_notebooks(client):
@@ -104,7 +108,8 @@ async def main_async(args):
             print(p['title'])
 
     elif args.cmd == 'read-page':
-        result = await find_page(client, args.notebook, args.section, args.page)
+        result = await find_page(client=client, notebook_name=args.notebook,
+                                 section_name=args.section, page_title=args.page)
         content = result['content']
         max_chars = 0 if args.full else args.max_chars
         if max_chars and len(content) > max_chars:
@@ -112,7 +117,8 @@ async def main_async(args):
         print(content)
 
     elif args.cmd == 'read-page-html':
-        result = await find_page(client, args.notebook, args.section, args.page)
+        result = await find_page(client=client, notebook_name=args.notebook,
+                                 section_name=args.section, page_title=args.page)
         print(result['html'])
 
     elif args.cmd == 'refresh':

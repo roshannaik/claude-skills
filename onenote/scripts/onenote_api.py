@@ -90,14 +90,24 @@ async def refresh_notebook(client, notebook_name: str) -> dict:
     return {'sections': len(sections), 'pages': sum(counts)}
 
 
-async def find_page(client, notebook_name: str, section_name: str, page_title: str) -> dict:
+async def find_page(client=None, notebook_name: str = None, section_name: str = None,
+                    page_title: str = None) -> dict:
     """Find a page and return its content.
 
-    Fast path   (0 API calls): page ID cached + content fresh.
+    Fast path   (0 API calls, no client needed): page ID cached + content fresh.
     Medium path (1 API call):  page ID cached, content stale/missing.
     Slow path   (2+ API calls): page ID not cached, fetches via API.
+
+    `client` is optional. Only constructed (and msal/msgraph imported) if the
+    cache miss path is hit.
     """
-    from onenote_setup import get_page_content
+    def _lazy_client():
+        nonlocal client
+        if client is None:
+            from onenote_setup import make_graph_client
+            client = make_graph_client()
+        return client
+
     cached = lookup_page(notebook_name, section_name, page_title)
 
     if cached and cached.get('id'):
@@ -105,31 +115,37 @@ async def find_page(client, notebook_name: str, section_name: str, page_title: s
         last_mod = cached.get('last_modified', '')
         html = load_content_cache(page_id, last_mod)
         if html is None:
-            html = await get_page_content(client, page_id)
+            from onenote_setup import get_page_content
+            html = await get_page_content(_lazy_client(), page_id)
             save_content_cache(page_id, html, last_mod)
         return {'id': page_id, 'title': page_title, 'content': strip_html(html), 'html': html}
 
-    pages = await get_pages(client, notebook_name, section_name)
+    pages = await get_pages(_lazy_client(), notebook_name, section_name)
     page  = next((p for p in pages if p['title'].lower() == page_title.lower()), None)
     if not page:
         raise ValueError(f"Page '{page_title}' not found in {notebook_name}/{section_name}. "
                          f"Available: {[p['title'] for p in pages]}")
     html = load_content_cache(page['id'], page.get('last_modified', ''))
     if html is None:
-        html = await get_page_content(client, page['id'])
+        from onenote_setup import get_page_content
+        html = await get_page_content(_lazy_client(), page['id'])
         save_content_cache(page['id'], html, page.get('last_modified', ''))
     return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
 
 
-async def find_pages_batch(client, page_specs: list[dict]) -> list[dict]:
+async def find_pages_batch(client=None, page_specs: list[dict] = None) -> list[dict]:
     """Fetch multiple pages in parallel.
 
     page_specs = [{'notebook': ..., 'section': ..., 'page': ...}, ...]
     Failed pages include an 'error' key instead of content.
+
+    `client` is optional. If every page in the batch is a cache hit, no Graph
+    client is ever constructed.
     """
     async def _fetch(spec):
         try:
-            return await find_page(client, spec['notebook'], spec['section'], spec['page'])
+            return await find_page(client=client, notebook_name=spec['notebook'],
+                                   section_name=spec['section'], page_title=spec['page'])
         except Exception as e:
             return {'title': spec.get('page', ''), 'content': '', 'html': '', 'error': str(e)}
     return list(await asyncio.gather(*[_fetch(s) for s in page_specs]))
