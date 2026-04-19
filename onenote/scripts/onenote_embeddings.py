@@ -1,3 +1,4 @@
+#!python3
 """Gemini embeddings for OneNote pages.
 
 Builds cache/embeddings.npz (ids + L2-normalized vectors) and
@@ -248,8 +249,10 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
             for (pid, _, pmeta), vec in zip(batch, embeddings):
                 v = np.asarray(vec, dtype=np.float32)
                 n = np.linalg.norm(v)
-                if n > 0:
-                    v = v / n
+                if not (n > 0) or not np.isfinite(v).all():
+                    print(f"  ! skipping {pid}: non-finite embedding (norm={n})", file=sys.stderr)
+                    continue
+                v = v / n
                 new_vecs[pid] = v
                 new_page_meta[pid] = pmeta
 
@@ -379,7 +382,8 @@ def semantic_search(query: str, top_k: int = 10,
     if n > 0:
         q /= n
 
-    # Cosine since vectors are L2-normalized
+    # Cosine since vectors are L2-normalized; clamp any stale bad rows to 0
+    vectors = np.nan_to_num(vectors, nan=0.0, posinf=0.0, neginf=0.0)
     scores = vectors @ q
 
     if notebook:

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!python3
 """
 Office file operations via Microsoft Graph API + python-docx/python-pptx.
 

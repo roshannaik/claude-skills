@@ -1,3 +1,4 @@
+#!python3
 """OneNote Graph API read operations.
 
 Heavy msgraph/msal imports are deferred to first call so cache-only operations

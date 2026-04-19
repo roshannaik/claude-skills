@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!python3
 """Build Gemini embeddings for cached OneNote pages.
 
 Incremental: pages whose last_modified matches the stored meta are skipped.

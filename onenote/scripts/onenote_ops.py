@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!python3
 """OneNote CLI entry point (read-only).
 
 Heavy lifting lives in sibling modules:

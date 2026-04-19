@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!python3
 """OneNote skill sync.
 
 Detects changes on the server with a single list_notebooks call, then refreshes

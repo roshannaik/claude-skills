@@ -1,3 +1,4 @@
+#!python3
 """OneNote local cache layer.
 
 Responsibilities:

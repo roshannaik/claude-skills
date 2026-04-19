@@ -1,3 +1,4 @@
+#!python3
 """
 OneNote / OneDrive access via Microsoft Graph API
 Uses MSAL device-code flow — no browser popup needed, works in CLI and Claude Code.

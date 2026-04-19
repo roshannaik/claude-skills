@@ -66,8 +66,5 @@ Six modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `go
 
 - No subprocess calls to `claude` anywhere. Embeddings use the Google GenAI SDK directly, not a Claude CLI.
 - No UNIX daemon, no `/tmp/*.sock` state. Previous design had one — removed to keep behavior identical across harnesses.
-- CLI paths are hardcoded to `~/.claude/skills/onenote/cache/` for now; revisit if another harness needs a different cache root.
+- Cache root is derived at runtime from `Path(__file__).parent.parent / 'cache'` (see `REFS_DIR` in `onenote_cache.py`), so invocations through any symlink — `~/.claude/skills/onenote/...`, `~/.openclaw/workspace/skills/onenote/...`, or the repo directly — all land on the same shared cache.
 
-## Obsolete context
-
-`onenote_redesign_context.md` (untracked) captured an earlier proposal for tiered Haiku summaries. That approach was superseded by Voyage embeddings — the summary system and its CLI (`routing-index`, `build_summaries.py`) have been removed. The doc is kept only as a reference to the decision history; don't build against it.

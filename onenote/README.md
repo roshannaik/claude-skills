@@ -89,7 +89,7 @@ To uninstall:
 ## First-time authentication
 
 ```bash
-python3 ~/.claude/skills/onenote/scripts/onenote_setup.py
+python3 ~/Projects/skills/onenote/scripts/onenote_setup.py
 ```
 
 This prints a device code and a URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.
@@ -101,7 +101,7 @@ This prints a device code and a URL. Open the URL in any browser, enter the code
 After authenticating and letting the skill cache some pages (any `read-page` or `refresh` call populates the content cache), run:
 
 ```bash
-python3 ~/.claude/skills/onenote/scripts/build_embeddings.py
+python3 ~/Projects/skills/onenote/scripts/build_embeddings.py
 ```
 
 This embeds every cached page via Gemini and writes `cache/embeddings.npz`. It's **incremental** — on later runs, only pages whose `last_modified` has changed are re-embedded. A first full build over ~1K pages takes ~25 minutes on Gemini's free tier due to the 30K TPM rate cap. Incremental updates are near-instant.
@@ -119,9 +119,9 @@ Newly shared notebooks need to be opened at least once in OneNote (web, desktop,
 ### Manual sync
 
 ```bash
-python3 ~/.claude/skills/onenote/scripts/sync.py                  # sync now
-python3 ~/.claude/skills/onenote/scripts/sync.py status           # idle / running
-python3 ~/.claude/skills/onenote/scripts/sync.py unstick          # kill a hung sync
+python3 ~/Projects/skills/onenote/scripts/sync.py                  # sync now
+python3 ~/Projects/skills/onenote/scripts/sync.py status           # idle / running
+python3 ~/Projects/skills/onenote/scripts/sync.py unstick          # kill a hung sync
 ```
 
 Only one sync runs at a time (enforced by `fcntl.flock`), so it's safe to invoke from any harness, cron, launchd, or a keystroke. The kernel releases the lock when the process dies — stale lockfiles can't block future runs.
@@ -145,7 +145,7 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <array>
     <string>/bin/zsh</string>
     <string>-ic</string>
-    <string>exec /usr/bin/python3 $HOME/.claude/skills/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
+    <string>exec /usr/bin/python3 $HOME/Projects/skills/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
   </array>
 
   <key>StartInterval</key>
@@ -154,9 +154,9 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <true/>
 
   <key>StandardOutPath</key>
-  <string>$HOME/.claude/skills/onenote/cache/sync.launchd.log</string>
+  <string>$HOME/Projects/skills/onenote/cache/sync.launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>$HOME/.claude/skills/onenote/cache/sync.launchd.log</string>
+  <string>$HOME/Projects/skills/onenote/cache/sync.launchd.log</string>
 
   <key>ProcessType</key>
   <string>Background</string>

@@ -1,22 +1,44 @@
 ---
 name: onenote
-description: Read Roshan's OneNote notebooks via Microsoft Graph API (read-only). Use when asked to look up or read content in any OneNote notebook (Health, Home Stuff, AI, Economy, HiFi, Hinduism, Spiritual Life, Family and Culture, All Hands, etc.). Semantic search over all pages via Gemini embeddings.
+description: Read OneNote notebooks via Microsoft Graph API. Use when asked to search or read content in any OneNote notebook (Health, Home Stuff, AI, Economy, HiFi, Hinduism, Spiritual Life, Family and Culture, All Hands, etc.). Semantic search over all pages via Gemini embeddings.
 argument-hint: 'query "sleep supplements", read Health/Supplements, list sections in Home Stuff'
 allowed-tools: Bash, Read
-author: clawdi
+author: Roshan Naik
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📓",
+        "os": ["darwin"],
+        "requires":
+          {
+            "bins": ["python3"],
+            "env": ["MS_CLIENT_ID", "GEMINI_API_KEY"],
+          },
+        "install":
+          [
+            {
+              "id": "pip-deps",
+              "kind": "pip",
+              "packages": ["msal", "msgraph-sdk", "google-genai", "numpy", "beautifulsoup4"],
+              "label": "Install Python dependencies",
+            },
+          ],
+      },
+  }
 ---
 
 # OneNote Skill
 
 ## Setup
 
-- Auth helper + Graph client: `~/.claude/skills/onenote/scripts/onenote_setup.py`
-- Operations script: `~/.claude/skills/onenote/scripts/onenote_ops.py`
+- Auth helper + Graph client: `~/Projects/skills/onenote/scripts/onenote_setup.py`
+- Operations script: `~/Projects/skills/onenote/scripts/onenote_ops.py`
 - Token cache: `~/.cache/ms_graph_token_cache.json` (no login needed)
-- Metadata cache: `~/.claude/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
-- Title index: `~/.claude/skills/onenote/cache/page_index.txt` (page titles + paths)
-- Page content cache: `~/.claude/skills/onenote/cache/page_content/*.html` (keyed by page ID)
-- Embeddings: `~/.claude/skills/onenote/cache/embeddings.npz` (Gemini vectors, 1024-dim) + `embeddings_meta.json`
+- Metadata cache: `~/Projects/skills/onenote/cache/onenote_cache.json` (never read directly — too large)
+- Title index: `~/Projects/skills/onenote/cache/page_index.txt` (page titles + paths)
+- Page content cache: `~/Projects/skills/onenote/cache/page_content/*.html` (keyed by page ID)
+- Embeddings: `~/Projects/skills/onenote/cache/embeddings.npz` (Gemini vectors, 1024-dim) + `embeddings_meta.json`
 
 **Never read `onenote_cache.json` directly** — use the CLI, which reads it internally.
 
@@ -37,10 +59,10 @@ Escalate only as needed. Cheaper tiers first.
 
 ```bash
 # Top 10 matches across all notebooks
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py query "sleep supplements I take"
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py query "sleep supplements I take"
 
 # Restrict to one notebook
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py query "morning routine" --notebook Health --top-k 5
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py query "morning routine" --notebook Health --top-k 5
 ```
 
 Output: `score  title  |  notebook / section` — pick the 1-3 most relevant pages, then fetch them.
@@ -60,13 +82,13 @@ Incremental — pages whose `last_modified` hasn't changed are reused.
 
 ```bash
 # Incremental rebuild for all notebooks
-python3 ~/.claude/skills/onenote/scripts/build_embeddings.py
+python3 ~/Projects/skills/onenote/scripts/build_embeddings.py
 
 # Force full rebuild (use after changing the model or the embed-text format)
-python3 ~/.claude/skills/onenote/scripts/build_embeddings.py --force
+python3 ~/Projects/skills/onenote/scripts/build_embeddings.py --force
 
 # Limit to specific notebooks
-python3 ~/.claude/skills/onenote/scripts/build_embeddings.py --notebook Health AI
+python3 ~/Projects/skills/onenote/scripts/build_embeddings.py --notebook Health AI
 ```
 
 Free tier on Google AI Studio (no card required) covers this. Pages without cached HTML are skipped — run `refresh` or `read-page` first to populate the content cache.
@@ -75,19 +97,19 @@ Free tier on Google AI Studio (no card required) covers this. Pages without cach
 
 ```bash
 # List all notebooks
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py list-notebooks
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py list-notebooks
 
 # List sections in a notebook
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py list-sections "Health"
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py list-sections "Health"
 
 # List pages in a section
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py list-pages "Health" "Supplements"
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py list-pages "Health" "Supplements"
 
 # Read a page (plain text — default for reading/answering questions)
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
 
 # Read a page (raw HTML — when you need the markup, not just text)
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
+python3 ~/Projects/skills/onenote/scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
 ```
 
 ## Parallel Read Operations (inline Python)
@@ -96,7 +118,7 @@ Use these when a question spans multiple pages or sections — fetches run concu
 
 ```python
 import asyncio, sys
-sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/onenote/scripts'))
+sys.path.insert(0, str(__import__('pathlib').Path.home() / 'Projects/skills/onenote/scripts'))
 from onenote_setup import make_graph_client
 from onenote_ops import find_pages_batch, refresh_all_notebooks
 

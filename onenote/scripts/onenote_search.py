@@ -1,3 +1,4 @@
+#!python3
 """OneNote local search (no API calls).
 
 - search_pages   — title grep via page_index.txt

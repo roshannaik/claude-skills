@@ -1,6 +1,6 @@
 # Claude Code Skills
 
-Three skills for [Claude Code](https://claude.ai/code) that connect it to Microsoft 365 and provide a code maintenance workflow.
+Three skills for [Claude Code](https://claude.ai/code) and that connect to Microsoft 365 and provide a code maintenance workflow.
 
 | Skill | What it does |
 |---|---|
@@ -27,8 +27,8 @@ If not installed:
 Each skill ships its own `requirements.txt`:
 
 ```bash
-pip install -r onenote/requirements.txt   # for the onenote skill
-pip install -r office/requirements.txt    # for the office skill (superset of onenote's)
+pip3 install -r onenote/requirements.txt   # for the onenote skill
+pip3 install -r office/requirements.txt    # for the office skill (superset of onenote's)
 ```
 
 ### 3. Azure app registration (onenote + office skills only)
@@ -83,7 +83,7 @@ This symlinks each skill into `~/.claude/skills/<skill>`, pointing back to the c
 ## First-time authentication (onenote + office)
 
 ```bash
-python3 ~/.claude/skills/onenote/scripts/onenote_setup.py
+python3 skills/onenote/scripts/onenote_setup.py
 ```
 
 This prints a device code and a URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.
