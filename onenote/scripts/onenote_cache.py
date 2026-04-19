@@ -11,6 +11,7 @@ All readers go through _load_cache() — never read the JSON directly. It has an
 in-memory mtime cache so the daemon doesn't re-parse on every call.
 """
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,23 @@ CACHE_JSON       = REFS_DIR / 'onenote_cache.json'
 PAGE_INDEX       = REFS_DIR / 'page_index.txt'
 PAGE_CONTENT_DIR = REFS_DIR / 'page_content'
 PAGE_CONTENT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Atomic write — tempfile + os.replace (POSIX atomic rename)
+# ---------------------------------------------------------------------------
+# Concurrent readers never see a partial file: the rename either hasn't
+# happened yet (they see the old file) or has happened (they see the new one).
+
+def atomic_write(path: Path, data, *, binary: bool = False) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f'.tmp.{os.getpid()}')
+    mode = 'wb' if binary else 'w'
+    with open(tmp, mode) as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 # ---------------------------------------------------------------------------
 # JSON cache — with in-memory mtime cache
@@ -43,7 +61,7 @@ def _load_cache() -> dict:
 def _save_cache(cache: dict) -> None:
     global _mem_cache, _mem_cache_mtime
     cache['_meta'] = {'last_updated': datetime.now().strftime('%Y-%m-%d')}
-    CACHE_JSON.write_text(json.dumps(cache, separators=(',', ':')))
+    atomic_write(CACHE_JSON, json.dumps(cache, separators=(',', ':')))
     _mem_cache = cache
     _mem_cache_mtime = CACHE_JSON.stat().st_mtime
     _rebuild_page_index(cache)
@@ -59,7 +77,7 @@ def _rebuild_page_index(cache: dict) -> None:
                 title   = page['title'] if isinstance(page, dict) else page
                 page_id = page.get('id', '') if isinstance(page, dict) else ''
                 lines.append(f"{title}\t{nb_name}\t{sec_name}\t{page_id}")
-    PAGE_INDEX.write_text('\n'.join(lines) + '\n')
+    atomic_write(PAGE_INDEX, '\n'.join(lines) + '\n')
 
 # ---------------------------------------------------------------------------
 # Page index — tab-separated rows, cached in memory
@@ -134,10 +152,14 @@ def load_content_cache(page_id: str, expected_modified: str) -> str:
     return None
 
 def save_content_cache(page_id: str, html: str, last_modified: str) -> None:
+    # Write HTML first, then .meta — readers key off .meta. If reader arrives
+    # between the two atomic renames, .meta still shows the OLD timestamp, so
+    # load_content_cache returns None (forces a refetch) instead of returning
+    # new HTML paired with an old meta.
     p = _content_path(page_id)
-    p.write_text(html)
+    atomic_write(p, html)
     if last_modified:
-        p.with_suffix('.meta').write_text(last_modified)
+        atomic_write(p.with_suffix('.meta'), last_modified)
 
 # ---------------------------------------------------------------------------
 # Cache update helpers — called after API fetches

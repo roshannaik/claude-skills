@@ -1,8 +1,8 @@
 ---
 name: onenote
-description: Read and write Roshan's OneNote notebooks via Microsoft Graph API. Use when asked to look up, read, update, or add content in any OneNote notebook (Health, Home Stuff, AI, Economy, HiFi, Hinduism, Spiritual Life, Family and Culture, All Hands, etc.). Semantic search over all pages via Voyage embeddings.
-argument-hint: 'semantic-search "sleep supplements", read Health/Supplements, list sections in Home Stuff'
-allowed-tools: Bash, Read, Write, Edit
+description: Read Roshan's OneNote notebooks via Microsoft Graph API (read-only). Use when asked to look up or read content in any OneNote notebook (Health, Home Stuff, AI, Economy, HiFi, Hinduism, Spiritual Life, Family and Culture, All Hands, etc.). Semantic search over all pages via Gemini embeddings.
+argument-hint: 'query "sleep supplements", read Health/Supplements, list sections in Home Stuff'
+allowed-tools: Bash, Read
 author: clawdi
 ---
 
@@ -28,8 +28,8 @@ Escalate only as needed. Cheaper tiers first.
 
 | Tier | When | Cost | Command |
 |------|------|------|---------|
-| **1. Semantic search** | Natural-language question, conceptual topic, "where is info about X" | 1 Gemini API call (~100 ms) | `onenote_ops.py semantic-search "<query>"` |
-| **2. Title search** | User named a page or you know the exact title | instant, no API | `onenote_ops.py search "<title keyword>"` |
+| **1. Semantic search** | Natural-language question, conceptual topic, "where is info about X" | 1 Gemini API call (~100 ms) | `onenote_ops.py query "<natural language query>"` |
+| **2. Title search** | User named a page or you know the exact title | instant, no API | `onenote_ops.py search-title "<title keyword>"` |
 | **3. Content grep** | Exact keyword in already-cached page HTML | ~100 ms, no API | `onenote_ops.py search-content "<keyword>"` |
 | **4. Full page read** | After routing via any tier above, to get the actual content | 1 API call per page (cached after first fetch) | `onenote_ops.py read-page <nb> <sec> <page>` |
 
@@ -37,10 +37,10 @@ Escalate only as needed. Cheaper tiers first.
 
 ```bash
 # Top 10 matches across all notebooks
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py semantic-search "sleep supplements I take"
+python3 ~/.claude/skills/onenote/scripts/onenote_ops.py query "sleep supplements I take"
 
 # Restrict to one notebook
-python3 ~/.claude/skills/onenote/scripts/onenote_ops.py semantic-search "morning routine" --notebook Health --top-k 5
+python3 ~/.claude/skills/onenote/scripts/onenote_ops.py query "morning routine" --notebook Health --top-k 5
 ```
 
 Output: `score  title  |  notebook / section` — pick the 1-3 most relevant pages, then fetch them.
@@ -48,7 +48,7 @@ Output: `score  title  |  notebook / section` — pick the 1-3 most relevant pag
 ### Standard workflow for content questions
 
 ```
-1. semantic-search "<query>"    # ~100 ms, 1 Gemini call, top-K with scores
+1. query "<natural language query>"  # ~100 ms, 1 Gemini call, top-K with scores
 2. Pick 1-3 target pages from the top results
 3. read-page for each target    # ~instant if cached
 4. Answer from content
@@ -86,7 +86,7 @@ python3 ~/.claude/skills/onenote/scripts/onenote_ops.py list-pages "Health" "Sup
 # Read a page (plain text — default for reading/answering questions)
 python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
 
-# Read a page (raw HTML — use when planning to update)
+# Read a page (raw HTML — when you need the markup, not just text)
 python3 ~/.claude/skills/onenote/scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
 ```
 
@@ -119,48 +119,6 @@ async def main():
 asyncio.run(main())
 ```
 
-## Write Operations (inline Python)
-
-For pages with a single note container, the standard write pattern is:
-
-1. Read the page to get its HTML
-2. Call `get_container_html(html)` to extract the container's inner HTML
-3. Inspect the structure (list, table, dated entries, sections, etc.) and decide where the new content belongs
-4. Build the modified inner HTML with the new content inserted at the right location
-5. Call `update_page` with `set_container_html(html, modified_inner)`
-
-```python
-import asyncio, sys
-sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/onenote/scripts'))
-from onenote_setup import make_graph_client
-from onenote_ops import get_sections, get_pages, find_page, update_page, get_container_html, set_container_html, create_page
-
-async def main():
-    client = make_graph_client()
-
-    # Write to a single-container page at the right location
-    page = await find_page(client, "AI", "MyAgent", "TODO")
-    inner = get_container_html(page['html'])
-    # Inspect `inner`, decide where the new item belongs, then:
-    modified_inner = inner + "<p>new todo item</p>"   # example: append at end
-    await update_page(client, page['id'], set_container_html(page['html'], modified_inner))
-
-    # Create a new page
-    sections = await get_sections(client, "Home Stuff")
-    sec = next(s for s in sections if s['name'] == 'Misc')
-    await create_page(client, sec['id'], "New Page Title", "<p>Content here</p>")
-
-asyncio.run(main())
-```
-
-### Write rules
-
-- **Always use `get_container_html` / `set_container_html`** for single-container pages — never blindly append to the raw body.
-- Read `inner` HTML before writing — inspect the structure (list items, table rows, dated entries, headings) and insert at the semantically correct location.
-- Both helpers raise `ValueError` if the page has zero or multiple containers.
-- `update_page` replaces the full page body — always reconstruct from the original `html` via `set_container_html` to avoid losing content.
-- For full rewrites (rare), pass new body HTML directly to `update_page`.
-
 ## Parsing Note Containers
 
 OneNote pages use absolute-positioned `<div>` blocks as note containers — each is a separate visual block on the canvas. Always parse by containers when reading structured pages, not by flattening all HTML into one blob.
@@ -182,13 +140,9 @@ When asked "what's in X", list containers first if the page appears to have mult
 ## Rules
 
 - **Answer concisely.** Lead with the direct answer to the user's question, then supporting detail only if it adds value. Prefer a short paragraph or a tight table over bulleted dumps. Skip source-page citations unless the user asks where it came from. Skip process narration ("I searched for X, then I read Y…") — the user doesn't need it.
-- **Semantic search first.** For any content question ("where is info about X", "what do my notes say about Y"), start with `semantic-search`. Tier 2/3 are for when the user names an exact page or keyword.
+- **Semantic search first.** For any content question ("where is info about X", "what do my notes say about Y"), start with `query`. Tier 2/3 are for when the user names an exact page or keyword.
 - **Don't truncate long journal/log pages when searching within them.** When a top-ranked semantic hit is a daily log, treatment log, or any chronological journal-style page (e.g. `Treatment Log`, `Progress`, `Daily Notes`), read the full page — specific details often live deep inside a multi-month entry and will be missed by a default 4K-char slice. Either load the full content (pass `--full` in CLI, or read `p['content']` without slicing in inline Python) or grep within the HTML for the specific keyword. Don't conclude the answer isn't there based on a truncated read.
 - **Never read `onenote_cache.json` directly** — use the CLI.
-- **Use `get_container_html` / `set_container_html`** for targeted writes to single-container pages.
-- Both container helpers raise `ValueError` if the page does not have exactly one container.
-- `update_page()` replaces the full body — always read the page HTML first and include all content you want to keep.
+- **This skill is read-only** — `update_page` / `create_page` have been removed. Do not try to modify OneNote content from this skill.
 - `find_page()` does case-insensitive, whitespace-insensitive title matching.
 - `strip_html()` from onenote_ops gives clean readable text from page HTML.
-- Pages return HTML — strip for display, keep raw for updates.
-- After writing/editing a page, re-run `build_embeddings.py` to refresh that page's embedding (incremental — only the edited page is re-embedded).

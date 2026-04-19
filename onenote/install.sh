@@ -33,6 +33,55 @@ else
 fi
 
 echo ""
+
+# ---------------------------------------------------------------------------
+# Report which required env vars are missing and where to put them.
+# Only checks the live shell env — if a var is set somewhere but not exported
+# to this shell, we'll still flag it, which is the safer default.
+# ---------------------------------------------------------------------------
+
+case "${SHELL:-}" in
+  *zsh)  profile="~/.zshrc"  ;;
+  *bash) profile="~/.bashrc" ;;
+  *)     profile="your shell profile" ;;
+esac
+
+missing=()
+[[ -z "${MS_CLIENT_ID:-}"   ]] && missing+=("MS_CLIENT_ID")
+[[ -z "${GEMINI_API_KEY:-}" && -z "${GOOGLE_API_KEY:-}" ]] && missing+=("GEMINI_API_KEY")
+
+if (( ${#missing[@]} > 0 )); then
+  echo "Missing required environment variables:"
+  for v in "${missing[@]}"; do
+    case "$v" in
+      MS_CLIENT_ID)
+        echo "  - MS_CLIENT_ID    Azure app registration Client ID (for Microsoft Graph / OneNote access)"
+        echo "                    Get one at https://portal.azure.com — see README.md §3"
+        ;;
+      GEMINI_API_KEY)
+        echo "  - GEMINI_API_KEY  Google AI Studio API key (for semantic search embeddings)"
+        echo "                    Get one free at https://aistudio.google.com/apikey — see README.md §4"
+        ;;
+    esac
+  done
+  echo ""
+  echo "Add them to $profile:"
+  for v in "${missing[@]}"; do
+    echo "  export $v=\"...\""
+  done
+  echo ""
+  echo "Then reload: source $profile"
+  echo ""
+fi
+
 echo "Next steps:"
-echo "  1. Set MS_CLIENT_ID in your shell profile (see README.md)"
-echo "  2. Run: python3 \"$target/scripts/onenote_setup.py\""
+step=1
+if (( ${#missing[@]} > 0 )); then
+  echo "  $step. Set the environment variables shown above"
+  step=$((step + 1))
+fi
+echo "  $step. Authenticate with Microsoft: python3 \"$target/scripts/onenote_setup.py\""
+step=$((step + 1))
+echo "  $step. Build the semantic-search index: python3 \"$target/scripts/build_embeddings.py\""
+step=$((step + 1))
+echo "  $step. (optional) Schedule a background sync — see README.md §'Keep the cache fresh'"

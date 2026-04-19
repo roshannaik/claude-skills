@@ -20,8 +20,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from onenote_cache import (
-    _load_cache, REFS_DIR, strip_html, load_content_cache,
+    _load_cache, REFS_DIR, strip_html, load_content_cache, atomic_write,
 )
+
+
+def _atomic_savez(path, **arrays) -> None:
+    """numpy.savez with atomic tempfile + os.replace semantics.
+
+    Keep the `.npz` suffix on tmp or numpy will append one itself, silently
+    writing to a different filename than we pass to os.replace.
+    """
+    import numpy as np
+    tmp = path.with_name(f'{path.name}.tmp.{os.getpid()}.npz')
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
 
 EMBEDDINGS_NPZ  = REFS_DIR / 'embeddings.npz'
 EMBEDDINGS_META = REFS_DIR / 'embeddings_meta.json'
@@ -209,8 +221,8 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
         sids = sorted(merged_vecs.keys())
         if sids:
             vectors = np.stack([merged_vecs[i] for i in sids]).astype(np.float32)
-            np.savez(EMBEDDINGS_NPZ, ids=np.array(sids), vectors=vectors)
-        EMBEDDINGS_META.write_text(json.dumps({
+            _atomic_savez(EMBEDDINGS_NPZ, ids=np.array(sids), vectors=vectors)
+        atomic_write(EMBEDDINGS_META, json.dumps({
             'model':    MODEL,
             'dim':      EMBED_DIM,
             'built_at': datetime.now(timezone.utc).isoformat(),
@@ -277,9 +289,9 @@ def build_embeddings(force: bool = False, notebook_filter: set = None) -> dict:
     ids = sorted(final_vecs.keys())
     if ids:
         vectors = np.stack([final_vecs[i] for i in ids]).astype(np.float32)
-        np.savez(EMBEDDINGS_NPZ, ids=np.array(ids), vectors=vectors)
+        _atomic_savez(EMBEDDINGS_NPZ, ids=np.array(ids), vectors=vectors)
 
-    EMBEDDINGS_META.write_text(json.dumps({
+    atomic_write(EMBEDDINGS_META, json.dumps({
         'model':    MODEL,
         'dim':      EMBED_DIM,
         'built_at': datetime.now(timezone.utc).isoformat(),

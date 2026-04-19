@@ -1,6 +1,6 @@
 # OneNote Skill
 
-Read and write OneNote notebooks via the Microsoft Graph API. Supports listing notebooks/sections/pages, reading page content, creating or updating pages, and **semantic search across all pages** via Gemini embeddings.
+Read OneNote notebooks via the Microsoft Graph API (read-only). Supports listing notebooks/sections/pages, reading page content, and **semantic search across all pages** via Gemini embeddings.
 
 ---
 
@@ -39,8 +39,9 @@ The skill authenticates via Microsoft's device-code flow — no browser popup, w
 7. Copy the **Application (client) ID**.
 8. Go to **API permissions → Add a permission → Microsoft Graph → Delegated permissions** and add:
    - `Notes.Read`
-   - `Notes.ReadWrite`
    - `User.Read`
+
+   (The skill is read-only; `Notes.ReadWrite` is not needed. If you previously granted it, you can leave it or remove it — unused.)
 9. Click **Grant admin consent** (or proceed — it will prompt on first auth).
 
 ### 4. Google AI Studio API key (for semantic search)
@@ -109,6 +110,99 @@ Re-run after significant edits, or let the skill trigger it automatically as nee
 
 ---
 
+## Keep the cache fresh (optional background sync)
+
+`scripts/sync.py` is a single-shot job that keeps the local cache and embeddings in sync with OneNote. It starts with a one-call `list_notebooks` check (~1 s) and only drills into notebooks whose `last_modified` has changed. For an unchanged account the whole sync is ~1–2 s; when pages have changed it refetches just those, prunes HTML for deleted pages, and incrementally rebuilds embeddings for the delta.
+
+Newly shared notebooks need to be opened at least once in OneNote (web, desktop, or mobile) to get picked up automatically on the next sync. Until then, the share invite is "pending" from the API's perspective and invisible to any caller — including this sync.
+
+### Manual sync
+
+```bash
+python3 ~/.claude/skills/onenote/scripts/sync.py                  # sync now
+python3 ~/.claude/skills/onenote/scripts/sync.py status           # idle / running
+python3 ~/.claude/skills/onenote/scripts/sync.py unstick          # kill a hung sync
+```
+
+Only one sync runs at a time (enforced by `fcntl.flock`), so it's safe to invoke from any harness, cron, launchd, or a keystroke. The kernel releases the lock when the process dies — stale lockfiles can't block future runs.
+
+### Schedule a 3-hour background sync (macOS, launchd)
+
+Install a user launch agent that fires every 3 hours and at login:
+
+```bash
+cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.claude-skills.onenote-sync</string>
+
+  <!-- zsh -ic sources ~/.zshrc so MS_CLIENT_ID + GEMINI_API_KEY are in
+       scope without duplicating secrets into the plist. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-ic</string>
+    <string>exec /usr/bin/python3 $HOME/.claude/skills/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>10800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>$HOME/.claude/skills/onenote/cache/sync.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/.claude/skills/onenote/cache/sync.launchd.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+EOF
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist
+```
+
+Verify it's loaded:
+
+```bash
+launchctl list | grep onenote-sync
+launchctl print gui/$(id -u)/com.claude-skills.onenote-sync | grep -E "state|run interval|last exit"
+```
+
+Kick off a run on demand without waiting 3 hours:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.claude-skills.onenote-sync
+```
+
+Unload / uninstall:
+
+```bash
+launchctl bootout gui/$(id -u)/com.claude-skills.onenote-sync
+rm ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist
+```
+
+Bash users: put the env vars in `~/.bashrc` and change the `-ic` line to `/bin/bash -ic`. Linux users: use cron or a systemd user timer with equivalent effect — the sync script itself is platform-agnostic.
+
+### Sync logs and stuck-process recovery
+
+Each run appends one JSON line to `cache/sync.log`:
+
+```json
+{"ts":"2026-04-19T03:13:08+00:00","status":"ok","elapsed_sec":1.9,"nb_dirty":0,"pages_added":0,"pages_mod":0,"pages_del":0,"embed_rebuilt":0,"embed_reused":1001}
+```
+
+Tail it any time: `tail -f cache/sync.log | jq .`
+
+If a sync wedges (e.g. Graph API hangs), it self-kills via `SIGALRM` after `--max-duration` seconds (default 600) and logs `status: "timeout"`. As a belt-and-suspenders measure, the lockfile body carries `{pid, started_at, hostname}`, so `sync.py unstick` can find and `SIGTERM/SIGKILL` the owning process even if the heartbeat was never written.
+
+---
+
 ## Usage
 
 Once installed, invoke in Claude Code:
@@ -125,8 +219,8 @@ Or describe what you want in natural language — Claude Code will invoke the sk
 CLI subcommands (for direct use outside Claude Code):
 
 ```bash
-onenote_ops.py semantic-search "<natural-language query>" [--top-k N] [--notebook NAME]
-onenote_ops.py search "<title keyword>"        # title grep, no API
+onenote_ops.py query "<natural-language query>" [--top-k N] [--notebook NAME]
+onenote_ops.py search-title "<title keyword>"  # title grep, no API
 onenote_ops.py search-content "<keyword>"      # HTML grep over cached pages
 onenote_ops.py read-page <nb> <sec> <page>     # plain-text
 onenote_ops.py read-page-html <nb> <sec> <page>
@@ -145,5 +239,13 @@ The skill caches API responses locally for speed:
 - `cache/page_content/` — individual page HTML snapshots (keyed by page ID)
 - `cache/embeddings.npz` — Gemini vectors for every cached page (~4 MB per ~1K pages)
 - `cache/embeddings_meta.json` — per-page `last_modified` + title/notebook/section for incremental rebuilds and query-time metadata
+
+Sync runtime state (also under `cache/`, gitignored):
+
+- `.sync.lock` — `flock`-held mutex; body carries `{pid, started_at, hostname, max_duration_sec}` for `status` / `unstick`
+- `.sync.heartbeat` — current step + timestamp, rewritten every 5 s
+- `.sync.state.json` — result of the most recent run
+- `sync.log` — JSONL, one row per run (timestamp, status, elapsed, page counts, embed counts, any error)
+- `sync.launchd.log` — stdout/stderr from the scheduled launchd job (if installed)
 
 All of these are in `.gitignore` and never committed. They rebuild automatically on a new machine after you run `onenote_setup.py` once and then `build_embeddings.py`.

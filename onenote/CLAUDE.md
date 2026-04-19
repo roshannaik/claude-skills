@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Claude Code skill (`onenote`) that reads/writes OneNote notebooks via Microsoft Graph and supports semantic search via Voyage embeddings. Installed as a symlink into `~/.claude/skills/onenote` by `install.sh`; edits to this repo take effect immediately — no build step.
+A Claude Code skill (`onenote`) that reads OneNote notebooks via Microsoft Graph and supports semantic search via Gemini embeddings. **Read-only by design** — write operations (`update_page`, `create_page`) have been removed from the skill. Installed as a symlink into `~/.claude/skills/onenote` by `install.sh`; edits to this repo take effect immediately — no build step.
 
 Designed to be harness-agnostic: core logic is importable as plain Python modules (no Claude-Code-specific dependencies). The CLI is a thin wrapper; Codex or any other harness can `import` the modules directly.
 
@@ -20,8 +20,8 @@ python3 scripts/onenote_setup.py
 
 # Smoke-test the CLI
 python3 scripts/onenote_ops.py list-notebooks
-python3 scripts/onenote_ops.py search "<title keyword>"
-python3 scripts/onenote_ops.py semantic-search "sleep supplements" --top-k 5
+python3 scripts/onenote_ops.py search-title "<title keyword>"
+python3 scripts/onenote_ops.py query "sleep supplements" --top-k 5
 
 # (Re)build embeddings — incremental by default
 python3 scripts/build_embeddings.py
@@ -30,19 +30,18 @@ python3 scripts/build_embeddings.py --notebook Health AI
 ```
 
 Required env vars:
-- `MS_CLIENT_ID` — Azure app registration (read/write OneNote via Graph)
+- `MS_CLIENT_ID` — Azure app registration (`Notes.ReadWrite` scope is granted at the infra level; the skill uses read APIs only)
 - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — Google AI Studio key for Gemini embeddings (build + query)
 
 ## Architecture
 
-Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `google-genai`, `numpy`) are deferred to first use so cache-only ops stay snappy.
+Six modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `google-genai`, `numpy`) are deferred to first use so cache-only ops stay snappy.
 
 | Module | Responsibility |
 |---|---|
 | `onenote_setup.py` | MSAL device-code auth, token cache at `~/.cache/ms_graph_token_cache.json`, thin Graph API wrappers. `make_graph_client()` is the entry point everything else imports. |
 | `onenote_cache.py` | JSON cache (`onenote_cache.json`) with in-memory mtime cache, page index (`page_index.txt`), per-page HTML cache (`page_content/*.html` + `.meta`), lookup helpers, cache-update helpers with ID-based rename detection, `strip_html()`. |
 | `onenote_api.py` | Graph API read ops — `get_notebooks`, `get_sections`, `get_pages`, `refresh_notebook`, `find_page`, `find_pages_batch`, `refresh_all_notebooks`. Freshness checks via `last_modified` to skip unchanged re-fetches. |
-| `onenote_write.py` | `update_page`, `create_page`, single-container helpers (`get_container_html` / `set_container_html`). |
 | `onenote_search.py` | `search_pages` (title grep) and `search_content` (HTML grep). Pure local, no API. |
 | `onenote_embeddings.py` | Gemini embeddings build + query (`gemini-embedding-001`, MRL-truncated to 1024 dims). Stores `cache/embeddings.npz` (float32, L2-normalized) + `cache/embeddings_meta.json` (model, per-page `last_modified` for incremental rebuilds). Query path: single matmul, no vector DB. |
 | `onenote_ops.py` | Thin CLI entry point. Re-exports everything from the above modules for backward compat with inline-Python usage (`from onenote_ops import find_page, ...`). |
@@ -60,10 +59,8 @@ Seven modules in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`, `
 ### Cache invariants to preserve
 
 - Renames (section or page) must be detected by **ID**, not by name — see `update_sections_cache` / `update_pages_cache`. Existing entries are carried forward by matching IDs against prior state.
-- `update_page()` **replaces** the full body. Always read the page HTML first and reconstruct via `set_container_html()` — raw append will destroy content.
-- `get_container_html()` / `set_container_html()` raise `ValueError` on zero or multiple containers. Pages with multiple absolute-positioned `<div>` containers need a different strategy (see "Parsing Note Containers" in `SKILL.md`).
 - Embedding vectors are **L2-normalized at build time** so cosine similarity reduces to a single dot product. If you add new vectors without normalizing, scores become meaningless.
-- After editing a page, re-run `build_embeddings.py` — incremental, only the changed page is re-embedded.
+- Read-only policy: do not reintroduce `update_page` / `create_page` / `_patch_page_content` / container-setter helpers. The skill is intentionally restricted to reads.
 
 ### Harness portability
 

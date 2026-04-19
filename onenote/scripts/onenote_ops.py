@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""OneNote CLI entry point.
+"""OneNote CLI entry point (read-only).
 
 Heavy lifting lives in sibling modules:
   - onenote_cache   — JSON cache, page index, content cache, update helpers
   - onenote_api     — Graph API read ops (get_notebooks, find_page, refresh_*)
-  - onenote_write   — update_page, create_page, container helpers
   - onenote_search  — title / content grep, routing index
 
 All names below are re-exported for backward compat with inline-Python usage
@@ -39,11 +38,6 @@ from onenote_api import (  # noqa: F401
     get_notebooks, get_sections, get_pages, refresh_notebook,
     find_page, find_pages_batch, refresh_all_notebooks,
 )
-from onenote_write import (  # noqa: F401
-    update_page, create_page,
-    get_container_html, set_container_html,
-    _patch_page_content, _CONTAINER_RE, _get_body,
-)
 from onenote_embeddings import semantic_search  # noqa: F401
 
 # ---------------------------------------------------------------------------
@@ -51,7 +45,7 @@ from onenote_embeddings import semantic_search  # noqa: F401
 # ---------------------------------------------------------------------------
 
 async def main_async(args):
-    if args.cmd == 'search':
+    if args.cmd == 'search-title':
         limit = args.limit if args.limit > 0 else None
         all_hits = search_pages(args.query)
         hits = all_hits[:limit] if limit else all_hits
@@ -78,7 +72,7 @@ async def main_async(args):
                 print(f"\n  ... and {len(h['snippets']) - 3} more occurrence(s)")
         return
 
-    if args.cmd == 'semantic-search':
+    if args.cmd == 'query':
         hits = semantic_search(args.query, top_k=args.top_k, notebook=args.notebook)
         if not hits:
             print('No results.')
@@ -155,7 +149,7 @@ if __name__ == '__main__':
     p = sub.add_parser('refresh')
     p.add_argument('notebook', help='Refresh all sections + pages in parallel')
 
-    p = sub.add_parser('search')
+    p = sub.add_parser('search-title')
     p.add_argument('query', help='Search page titles (grep, no API)')
     p.add_argument('--limit', type=int, default=20,
                    help='Max results to show (default 20). Use 0 for all.')
@@ -167,8 +161,8 @@ if __name__ == '__main__':
     p.add_argument('--context', type=int, default=200,
                    help='Characters of context around each match (default 200).')
 
-    p = sub.add_parser('semantic-search',
-                       help='Semantic search across all pages using Voyage embeddings')
+    p = sub.add_parser('query',
+                       help='Semantic search across all pages using Gemini embeddings')
     p.add_argument('query', help='Natural language query')
     p.add_argument('--top-k', type=int, default=10, dest='top_k',
                    help='Number of results to return (default 10)')
