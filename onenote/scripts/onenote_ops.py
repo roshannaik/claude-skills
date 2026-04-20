@@ -54,17 +54,7 @@ from onenote_media import (  # noqa: F401
 # fetch-media helpers
 # ---------------------------------------------------------------------------
 
-def _iter_all_pages():
-    """Yield (notebook, section, title, page_id, last_modified) for every cached page."""
-    cache = _load_cache()
-    for nb_name, nb_data in cache.items():
-        if nb_name.startswith('_'):
-            continue
-        for sec_name, sec_data in nb_data.get('sections', {}).items():
-            for page in sec_data.get('pages', []):
-                if isinstance(page, dict) and page.get('id'):
-                    yield (nb_name, sec_name, page['title'], page['id'],
-                           page.get('last_modified', ''))
+from onenote_cache import iter_all_pages as _iter_all_pages  # noqa: E402,F401
 
 
 def _resolve_identifier(ident: str):

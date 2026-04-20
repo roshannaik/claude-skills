@@ -284,12 +284,8 @@ CAPTION_MIN_CHARS = 20          # minimum meaningful caption length
 
 
 def _get_genai_client():
-    import os
-    from google import genai
-    api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        raise SystemExit('GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set.')
-    return genai.Client(api_key=api_key)
+    from onenote_genai import get_client
+    return get_client()
 
 
 def _non_ws_len(s: str) -> int:
@@ -299,13 +295,12 @@ def _non_ws_len(s: str) -> int:
 def _gemini_generate_from_bytes(client, model: str, prompt: str,
                                  data: bytes, mime: str) -> str:
     from google.genai import types
-    resp = client.models.generate_content(
+    from onenote_genai import with_retry
+    resp = with_retry(
+        client.models.generate_content,
         model=model,
-        contents=[
-            types.Part.from_bytes(data=data, mime_type=mime),
-            prompt,
-        ],
-    )
+        contents=[types.Part.from_bytes(data=data, mime_type=mime), prompt],
+        max_attempts=5, base_wait=2.0, max_wait=30.0, label='media-gen')
     return (resp.text or '').strip()
 
 
@@ -488,8 +483,7 @@ def save_hydrated_html(page_id: str, html: str, out_path=None):
     hydrated, summary = render_hydrated_html(page_id, html)
     if out_path is None:
         PAGE_RENDERED_DIR.mkdir(parents=True, exist_ok=True)
-        safe = page_id.replace('!', '_').replace('/', '_')
-        out_path = PAGE_RENDERED_DIR / f'{safe}.html'
+        out_path = PAGE_RENDERED_DIR / f'{safe_resource_id(page_id)}.html'
     atomic_write(out_path, hydrated)
     summary['output_path'] = str(out_path)
     return out_path, summary
@@ -505,27 +499,22 @@ def gc_media(dry_run: bool = False) -> dict:
 
     Returns {deleted: [paths], kept: N, orphaned_bytes: int}.
     """
-    from onenote_cache import _load_cache, _content_path, load_content_cache
+    from onenote_cache import _content_path, load_content_cache, iter_all_pages
 
-    # Build set of currently-referenced resource IDs across all cached pages
+    # Build set of currently-referenced resource IDs across all cached pages.
+    # If load_content_cache is stale but an HTML file exists on disk, still use
+    # it — gc shouldn't miss references due to a meta mismatch.
     referenced = set()
-    cache = _load_cache()
-    for nb_name, nb_data in cache.items():
-        if nb_name.startswith('_'):
-            continue
-        for sec_data in nb_data.get('sections', {}).values():
-            for page in sec_data.get('pages', []):
-                if not isinstance(page, dict) or not page.get('id'):
-                    continue
-                html = load_content_cache(page['id'], page.get('last_modified', ''))
-                if html is None:
-                    path = _content_path(page['id'])
-                    if path.exists():
-                        html = path.read_text()
-                if not html:
-                    continue
-                for ref in parse_resources(html):
-                    referenced.add(ref['resource_id'])
+    for _nb, _sec, _title, pid, lm in iter_all_pages():
+        html = load_content_cache(pid, lm)
+        if html is None:
+            path = _content_path(pid)
+            try:
+                html = path.read_text()
+            except OSError:
+                continue
+        for ref in parse_resources(html):
+            referenced.add(ref['resource_id'])
 
     # Walk cache/page_resources/ and find raw-byte files whose safe-id prefix
     # doesn't map to any referenced resource_id.

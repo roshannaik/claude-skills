@@ -26,12 +26,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from onenote_cache import _load_cache, _content_path, load_content_cache, strip_html, REFS_DIR
+from onenote_cache import (
+    _load_cache, _content_path, load_content_cache, strip_html, atomic_write,
+    iter_all_pages, REFS_DIR, PAGE_SUBJECTS_JSON, SUBJECT_OVERRIDES,
+)
 from onenote_media import parse_resources, load_ocr, load_caption
-
-
-PAGE_SUBJECTS_JSON  = REFS_DIR / 'page_subjects.json'
-SUBJECT_OVERRIDES   = REFS_DIR / 'subject_overrides.json'
+from onenote_genai import get_client, with_retry
 
 CLASSIFIER_MODEL    = 'gemini-2.5-flash'
 BODY_CHAR_CAP       = 1800
@@ -76,12 +76,6 @@ def _load_page_subjects() -> dict:
     if PAGE_SUBJECTS_JSON.exists():
         return json.loads(PAGE_SUBJECTS_JSON.read_text())
     return {}
-
-
-def _atomic_write(path: Path, data: str):
-    tmp = path.with_name(path.name + f'.tmp.{os.getpid()}')
-    tmp.write_text(data)
-    os.replace(tmp, path)
 
 
 def _page_context(pid: str, html: str) -> tuple:
@@ -136,11 +130,7 @@ def _build_prompt(page_meta: dict, body: str, ocr_snippets: list, candidates: li
 
 
 def classify_pages(force: bool = False, pages_file: str = None) -> dict:
-    from google import genai
-    api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        raise SystemExit('GEMINI_API_KEY not set.')
-    client = genai.Client(api_key=api_key)
+    client = get_client()
 
     cache = _load_cache()
     candidates = _gather_candidates(cache)
@@ -150,28 +140,22 @@ def classify_pages(force: bool = False, pages_file: str = None) -> dict:
     existing = {} if force else _load_page_subjects()
     targets = []
 
-    # Build target list
     if pages_file:
         want = set(l.strip() for l in Path(pages_file).read_text().splitlines()
                    if l.strip() and not l.startswith('#'))
     else:
         want = None
 
-    for nb, nbd in cache.items():
-        if nb.startswith('_'): continue
-        for sec, sd in nbd.get('sections', {}).items():
-            for p in sd.get('pages', []):
-                if not isinstance(p, dict) or not p.get('id'): continue
-                pid = p['id']
-                label_key = f'{nb} / {sec} / {p["title"]}'
-                if want is not None and label_key not in want and pid not in want:
-                    continue
-                if pid in existing:
-                    continue
-                html = load_content_cache(pid, p.get('last_modified', ''))
-                if html is None:
-                    continue
-                targets.append((pid, nb, sec, p['title'], html))
+    for nb, sec, title, pid, lm in iter_all_pages():
+        label_key = f'{nb} / {sec} / {title}'
+        if want is not None and label_key not in want and pid not in want:
+            continue
+        if pid in existing:
+            continue
+        html = load_content_cache(pid, lm)
+        if html is None:
+            continue
+        targets.append((pid, nb, sec, title, html))
 
     print(f'Classifying {len(targets)} pages '
           f'(skipping {len(existing)} already labelled)...', file=sys.stderr)
@@ -189,20 +173,15 @@ def classify_pages(force: bool = False, pages_file: str = None) -> dict:
         body, ocr_snippets = _page_context(pid, html)
         prompt = _build_prompt({'notebook': nb, 'section': sec, 'title': title},
                                 body, ocr_snippets, candidates)
-        for attempt in range(6):
-            try:
-                resp = client.models.generate_content(
-                    model=CLASSIFIER_MODEL, contents=[prompt])
-                label = (resp.text or '').strip().split('\n')[0].strip()
-                return pid, nb, sec, title, label, None
-            except Exception as e:
-                msg = str(e)
-                is_transient = ('429' in msg or '503' in msg or 'UNAVAILABLE' in msg
-                                or 'RESOURCE_EXHAUSTED' in msg or 'rate' in msg.lower())
-                if attempt == 5 or not is_transient:
-                    return pid, nb, sec, title, None, msg[:160]
-                time.sleep(min(30, 2 * (2 ** attempt)))
-        return pid, nb, sec, title, None, 'exhausted retries'
+        try:
+            resp = with_retry(
+                client.models.generate_content,
+                model=CLASSIFIER_MODEL, contents=[prompt],
+                max_attempts=6, base_wait=2.0, max_wait=30.0, label='classifier')
+            label = (resp.text or '').strip().split('\n')[0].strip()
+            return pid, nb, sec, title, label, None
+        except Exception as e:
+            return pid, nb, sec, title, None, str(e)[:160]
 
     done = 0
     errors = 0
@@ -228,9 +207,9 @@ def classify_pages(force: bool = False, pages_file: str = None) -> dict:
                           f'({(time.time()-t0):.0f}s, {done/max((time.time()-t0),1)*60:.0f}/min)',
                           file=sys.stderr)
                 if done % CHECKPOINT_EVERY == 0 or done == len(targets):
-                    _atomic_write(PAGE_SUBJECTS_JSON, json.dumps(out, indent=2))
+                    atomic_write(PAGE_SUBJECTS_JSON, json.dumps(out, indent=2))
 
-    _atomic_write(PAGE_SUBJECTS_JSON, json.dumps(out, indent=2))
+    atomic_write(PAGE_SUBJECTS_JSON, json.dumps(out, indent=2))
     print(f'Done. {len(out)} labels saved to {PAGE_SUBJECTS_JSON} '
           f'in {time.time()-t0:.0f}s', file=sys.stderr)
 

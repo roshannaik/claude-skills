@@ -30,7 +30,7 @@ from pathlib import Path
 from onenote_cache import strip_html
 from onenote_media import (
     parse_resources, load_resource, _find_byte_file,
-    _ocr_path, _caption_path, _transcript_path,
+    _ocr_path, _caption_path, _transcript_path, _non_ws_len,
     OCR_MIN_CHARS, CAPTION_MIN_CHARS,
 )
 
@@ -156,10 +156,6 @@ def _clean(s: str) -> str:
     return _WS.sub(' ', strip_html(s)).strip()
 
 
-def _non_ws_len(s: str) -> int:
-    return len(re.sub(r'\s+', '', s or ''))
-
-
 def _sentence_count(s: str) -> int:
     return len(_SENT_END.findall(s))
 
@@ -220,9 +216,6 @@ def _parse_table(table_html: str) -> tuple:
             header = cell_texts
         else:
             rows.append(cell_texts)
-    # If no explicit header row detected but the first row looks like labels
-    # (short cells, no numbers), call it header. Keep it simple: require
-    # explicit <th> for now.
     return rows, (header or [])
 
 
@@ -584,14 +577,14 @@ def chunk_page(page_id: str, html: str, page_meta: dict) -> list:
         ))
 
     # ---- Media chunks ----
+    # Bytes absent (`byte_path is None`) just means no raw-media chunk gets
+    # emitted for that resource — we still emit OCR/caption/transcript
+    # siblings below if those derived text files exist on disk.
     for ref in parse_resources(html):
         rid = ref['resource_id']
         byte_path = _find_byte_file(rid)
         mime = ref['mime']
         kind = ref['kind']
-        if byte_path is None:
-            # Bytes not cached — skip, but emit OCR sibling if present
-            pass
 
         if kind == 'video':
             # Video: transcript-only text chunk. Skip raw multimodal embedding.

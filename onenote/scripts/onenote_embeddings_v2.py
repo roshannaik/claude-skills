@@ -21,8 +21,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from onenote_cache import _load_cache, REFS_DIR, load_content_cache, atomic_write
+from onenote_cache import (
+    _load_cache, REFS_DIR, load_content_cache, atomic_write, atomic_savez,
+    iter_all_pages, pages_by_id,
+    PAGE_SUBJECTS_JSON, SUBJECT_OVERRIDES,
+)
 from onenote_chunks import chunk_page, Chunk
+from onenote_genai import get_client, with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -40,31 +45,25 @@ CHECKPOINT_EVERY    = 50      # save partial state every N embed successes
 
 EMBEDDINGS_NPZ      = REFS_DIR / 'embeddings_v2.npz'
 EMBEDDINGS_META     = REFS_DIR / 'embeddings_v2_meta.json'
-PAGE_SUBJECTS_JSON  = REFS_DIR / 'page_subjects.json'
-SUBJECT_OVERRIDES   = REFS_DIR / 'subject_overrides.json'
 
 USER_SELF_LABEL     = 'self'   # label used for pages about the user
 
 
 # ---------------------------------------------------------------------------
-# Client + single embed call
+# Embed call with hard timeout + retry
 # ---------------------------------------------------------------------------
-
-def _get_client():
-    from google import genai
-    api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-    if not api_key:
-        raise SystemExit('GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.')
-    return genai.Client(api_key=api_key)
-
 
 _EMBED_CALL_TIMEOUT_SEC = 90   # hard timeout per embed_content call
 
 
+def _get_client():
+    # Kept for backward-compat with callers that may import this symbol.
+    return get_client()
+
+
 def _embed_call(client, contents: list, task_type: str):
-    """Raw embed_content call with a hard timeout so a stalled TCP doesn't
-    hang the whole build. Runs the sync SDK call in a worker thread and
-    times out if it exceeds _EMBED_CALL_TIMEOUT_SEC."""
+    """embed_content with a hard per-call timeout so a stalled TCP doesn't
+    hang the whole build. Runs the sync SDK call in a worker thread."""
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
     from google.genai import types
 
@@ -89,24 +88,9 @@ def _embed_call(client, contents: list, task_type: str):
 
 
 def _embed_with_retry(client, contents: list, task_type: str):
-    last_err = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            return _embed_call(client, contents, task_type)
-        except Exception as e:
-            msg = str(e)
-            last_err = e
-            is_rate = ('429' in msg or 'rate' in msg.lower() or 'quota' in msg.lower()
-                       or 'RESOURCE_EXHAUSTED' in msg or '503' in msg
-                       or 'UNAVAILABLE' in msg or 'TimeoutError' in msg
-                       or 'exceeded' in msg.lower())
-            if attempt == MAX_RETRIES - 1 or not is_rate:
-                raise
-            wait = min(60, 4 * (2 ** attempt))
-            print(f'  ! transient error ({msg[:80]}); sleeping {wait}s (attempt {attempt+1}/{MAX_RETRIES})',
-                  file=sys.stderr)
-            time.sleep(wait)
-    raise last_err
+    return with_retry(_embed_call, client, contents, task_type,
+                       max_attempts=MAX_RETRIES, base_wait=4.0, max_wait=60.0,
+                       label='embed')
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +141,6 @@ def _load_vectors():
     return {cid: vecs[i] for i, cid in enumerate(ids)}
 
 
-def _atomic_savez(path, **arrays):
-    import numpy as np
-    tmp = path.with_name(f'{path.name}.tmp.{os.getpid()}.npz')
-    np.savez(tmp, **arrays)
-    os.replace(tmp, path)
-
-
 def _save_state(vectors: dict, kinds: dict, pages_meta: dict, chunks_meta: dict):
     import numpy as np
     if not vectors:
@@ -172,7 +149,7 @@ def _save_state(vectors: dict, kinds: dict, pages_meta: dict, chunks_meta: dict)
     ids = sorted(vectors.keys())
     vecs = np.stack([vectors[i] for i in ids]).astype(np.float32)
     kinds_arr = np.array([kinds[i] for i in ids])
-    _atomic_savez(EMBEDDINGS_NPZ, ids=np.array(ids), vectors=vecs, kinds=kinds_arr)
+    atomic_savez(EMBEDDINGS_NPZ, ids=np.array(ids), vectors=vecs, kinds=kinds_arr)
     atomic_write(EMBEDDINGS_META, json.dumps({
         'model':    MODEL,
         'dim':      EMBED_DIM,
@@ -193,20 +170,9 @@ def _resolve_page_ids(page_ids: list, pages_file: str) -> list:
         lines = Path(pages_file).read_text().splitlines()
         idents.extend(l.strip() for l in lines if l.strip() and not l.startswith('#'))
 
-    cache = _load_cache()
-    # Build a catalog of all pages for lookup
-    by_id = {}
-    by_path = {}
-    for nb, nbd in cache.items():
-        if nb.startswith('_'):
-            continue
-        for sec, sd in nbd.get('sections', {}).items():
-            for p in sd.get('pages', []):
-                if not isinstance(p, dict) or not p.get('id'):
-                    continue
-                by_id[p['id']] = (nb, sec, p)
-                key = f'{nb.lower()}/{sec.lower()}/{p["title"].lower()}'
-                by_path[key] = p['id']
+    by_id = pages_by_id()
+    by_path = {f'{nb.lower()}/{sec.lower()}/{p["title"].lower()}': pid
+               for pid, (nb, sec, p) in by_id.items()}
 
     resolved = []
     missing = []
@@ -256,36 +222,24 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
 
     existing_vecs = {} if force else _load_vectors()
 
-    # Build the target page set
+    # Build a single {pid: (nb, sec, page)} index so both the full-corpus
+    # target list and the per-pid metadata lookup are O(1). Previously the
+    # per-pid lookup did a full notebook/section/page scan per target pid,
+    # which was O(P×N) for P targets across N pages.
+    pid_index = pages_by_id()
+
     if page_ids or pages_file:
         target_pids = _resolve_page_ids(page_ids, pages_file)
     else:
-        cache = _load_cache()
-        target_pids = [
-            p['id']
-            for nb, nbd in cache.items() if not nb.startswith('_')
-            for sec, sd in nbd.get('sections', {}).items()
-            for p in sd.get('pages', []) if isinstance(p, dict) and p.get('id')
-        ]
+        target_pids = list(pid_index.keys())
     if not target_pids:
         return {'error': 'no pages resolved'}
 
-    # ---- Chunk every target page ----
     all_chunks = []            # list of (chunk, page_id, page_meta_dict)
-    cache = _load_cache()
     pages_to_rebuild = {}
 
     for pid in target_pids:
-        # Look up page metadata
-        row = None
-        for nb, nbd in cache.items():
-            if nb.startswith('_'): continue
-            for sec, sd in nbd.get('sections', {}).items():
-                for p in sd.get('pages', []):
-                    if isinstance(p, dict) and p.get('id') == pid:
-                        row = (nb, sec, p); break
-                if row: break
-            if row: break
+        row = pid_index.get(pid)
         if not row:
             continue
         nb, sec, p = row
@@ -448,7 +402,9 @@ def _load_for_query():
         data = np.load(EMBEDDINGS_NPZ, allow_pickle=False)
         _query_state['ids']     = data['ids'].tolist()
         _query_state['kinds']   = data['kinds'].tolist() if 'kinds' in data.files else None
-        _query_state['vectors'] = data['vectors']
+        # Sanitize once at load so per-query matmul never pays for it.
+        _query_state['vectors'] = np.nan_to_num(
+            data['vectors'], nan=0.0, posinf=0.0, neginf=0.0)
         _query_state['meta']    = _load_meta()
         _query_state['mtime']   = mtime
         _query_state['subjects'] = _load_subjects()
@@ -532,7 +488,7 @@ def semantic_search(query: str, top_k_pages: int = 10,
     if n > 0:
         q /= n
 
-    vectors = np.nan_to_num(vectors, nan=0.0, posinf=0.0, neginf=0.0)
+    # vectors are already NaN-sanitized at load (see _load_for_query)
     scores = vectors @ q
 
     chunks_meta = meta.get('chunks', {})
@@ -578,8 +534,12 @@ def semantic_search(query: str, top_k_pages: int = 10,
             if subj not in effective_allowed:
                 scores[idx] = -1.0
 
-    # Walk descending scores, dedupe by page w/ max-N
-    order = np.argsort(-scores)
+    # Walk descending scores, dedupe by page w/ max-N. Use argpartition to
+    # avoid sorting all N chunks when we only need a small top slice; take a
+    # generous candidate pool (top_k × max_n × fanout) to survive filtering.
+    candidate_pool = min(len(scores), max(200, top_k_pages * max_n_per_page * 5))
+    part = np.argpartition(-scores, candidate_pool - 1)[:candidate_pool]
+    order = part[np.argsort(-scores[part])]
     per_page_count = {}
     per_page_hits = {}
     for idx in order:

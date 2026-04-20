@@ -23,6 +23,12 @@ PAGE_INDEX       = REFS_DIR / 'page_index.txt'
 PAGE_CONTENT_DIR = REFS_DIR / 'page_content'
 PAGE_CONTENT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Subject-classification artifacts (written by classify_subjects.py,
+# read at query time by onenote_embeddings_v2). Defined here to avoid
+# duplicating the path constants across modules.
+PAGE_SUBJECTS_JSON = REFS_DIR / 'page_subjects.json'
+SUBJECT_OVERRIDES  = REFS_DIR / 'subject_overrides.json'
+
 # ---------------------------------------------------------------------------
 # Atomic write — tempfile + os.replace (POSIX atomic rename)
 # ---------------------------------------------------------------------------
@@ -38,6 +44,17 @@ def atomic_write(path: Path, data, *, binary: bool = False) -> None:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_savez(path: Path, **arrays) -> None:
+    """numpy.savez with tempfile + os.replace. Keeps `.npz` suffix on tmp or
+    numpy silently appends one to a different filename than os.replace sees."""
+    import numpy as np
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'{path.name}.tmp.{os.getpid()}.npz')
+    np.savez(tmp, **arrays)
     os.replace(tmp, path)
 
 # ---------------------------------------------------------------------------
@@ -248,3 +265,39 @@ def update_pages_cache(notebook_name: str, section_name: str, pages: list,
 def strip_html(html: str) -> str:
     text = re.sub(r'<[^>]+>', ' ', html)
     return re.sub(r'\s+', ' ', text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Whole-corpus walkers
+# ---------------------------------------------------------------------------
+
+def iter_all_pages():
+    """Yield (notebook, section, title, page_id, last_modified) for every
+    cached page with a valid id."""
+    cache = _load_cache()
+    for nb_name, nb_data in cache.items():
+        if nb_name.startswith('_'):
+            continue
+        for sec_name, sec_data in nb_data.get('sections', {}).items():
+            for page in sec_data.get('pages', []):
+                if isinstance(page, dict) and page.get('id'):
+                    yield (nb_name, sec_name, page['title'], page['id'],
+                           page.get('last_modified', ''))
+
+
+def pages_by_id() -> dict:
+    """Return {page_id: (notebook, section, page_dict)} — O(1) lookup helper.
+
+    Useful inside loops that would otherwise re-scan the cache per page_id.
+    Snapshot is taken once from _load_cache(); callers should rebuild after
+    cache mutations."""
+    out = {}
+    cache = _load_cache()
+    for nb_name, nb_data in cache.items():
+        if nb_name.startswith('_'):
+            continue
+        for sec_name, sec_data in nb_data.get('sections', {}).items():
+            for page in sec_data.get('pages', []):
+                if isinstance(page, dict) and page.get('id'):
+                    out[page['id']] = (nb_name, sec_name, page)
+    return out
