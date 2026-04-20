@@ -219,7 +219,22 @@ def update_pages_cache(notebook_name: str, section_name: str, pages: list,
             'title':         p['title'],
             'id':            p['id'],
             'last_modified': p.get('last_modified', ''),
+            'level':         p.get('level', 0),
+            'order':         p.get('order', 0),
         })
+
+    # Sort by order so the parent_page_id pass walks in document order.
+    new_pages.sort(key=lambda x: x.get('order', 0))
+
+    # Derive parent_page_id per subpage — nearest preceding page with a
+    # strictly lower level. Stack-based single pass.
+    stack: list = []   # [(level, page_id), ...] monotonically increasing in level
+    for pg in new_pages:
+        lvl = pg.get('level', 0) or 0
+        while stack and stack[-1][0] >= lvl:
+            stack.pop()
+        pg['parent_page_id'] = stack[-1][1] if stack else ''
+        stack.append((lvl, pg['id']))
 
     cache[nb_key]['sections'][sec_key]['pages'] = new_pages
     if section_modified:

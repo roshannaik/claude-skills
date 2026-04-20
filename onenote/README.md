@@ -98,15 +98,32 @@ This prints a device code and a URL. Open the URL in any browser, enter the code
 
 ## Build the semantic-search index
 
-After authenticating and letting the skill cache some pages (any `read-page` or `refresh` call populates the content cache), run:
+After authenticating and letting the skill cache some pages (any `read-page` or `refresh` call populates the content cache), there are two index paths — **v2 (default, recommended)** and **v1 (legacy)**.
+
+### v2 — chunked + multimodal (recommended)
 
 ```bash
-python3 ~/Projects/skills/onenote/scripts/build_embeddings.py
+# 1. Pull media resources + run OCR/caption/transcribe (one-off, per new content)
+python3 scripts/onenote_ops.py fetch-media --all
+
+# 2. Classify pages by subject (one-off, for subject-aware filtering)
+python3 scripts/classify_subjects.py
+
+# 3. Build chunked embeddings (gemini-embedding-2-preview, 768d, unified text+media)
+python3 scripts/build_embeddings.py --v2
 ```
 
-This embeds every cached page via Gemini and writes `cache/embeddings.npz`. It's **incremental** — on later runs, only pages whose `last_modified` has changed are re-embedded. A first full build over ~1K pages takes ~25 minutes on Gemini's free tier due to the 30K TPM rate cap. Incremental updates are near-instant.
+Step 1 fetches each image/PDF/mp4 referenced in the cached HTML, then runs Gemini 2.5 flash OCR on every image (scene caption for empty-OCR ones) and transcription on audio/video. Step 2 labels each page so subject-aware queries work. Step 3 chunks each page adaptively and embeds text + media bytes into a single vector space.
 
-Re-run after significant edits, or let the skill trigger it automatically as needed.
+All three are **incremental** — unchanged pages/resources are skipped. First full build on ~1K pages costs ~$2 on the Gemini paid tier; subsequent runs are pennies. Checkpoints are saved every 50 chunks so a crash mid-build keeps progress.
+
+### v1 — page-level, text-only (legacy)
+
+```bash
+python3 scripts/build_embeddings.py
+```
+
+Kept for backward compatibility. Produces one vector per page with `gemini-embedding-001`. Run only if you explicitly want the legacy path; the v2 store supersedes it.
 
 ---
 
@@ -219,26 +236,135 @@ Or describe what you want in natural language — Claude Code will invoke the sk
 CLI subcommands (for direct use outside Claude Code):
 
 ```bash
-onenote_ops.py query "<natural-language query>" [--top-k N] [--notebook NAME]
-onenote_ops.py search-title "<title keyword>"  # title grep, no API
-onenote_ops.py search-content "<keyword>"      # HTML grep over cached pages
-onenote_ops.py read-page <nb> <sec> <page>     # plain-text
+# Semantic search (v2 — chunked + multimodal + subject-aware)
+onenote_ops.py query "<query>" --v2 [--top-k N] [--max-n M] [--notebook NB]
+                                [--subject self,Dad,...] [--include-general]
+                                [--no-subject-filter]
+
+# Semantic search (v1 — legacy page-level)
+onenote_ops.py query "<query>" [--top-k N] [--notebook NB]
+
+# Cached / non-semantic operations
+onenote_ops.py search-title "<title keyword>"     # title grep, no API
+onenote_ops.py search-content "<keyword>"         # HTML grep over cached pages
+onenote_ops.py read-page <nb> <sec> <page>        # plain-text
 onenote_ops.py read-page-html <nb> <sec> <page>
 onenote_ops.py list-notebooks | list-sections <nb> | list-pages <nb> <sec>
-onenote_ops.py refresh <nb>                    # force re-fetch sections + pages
+onenote_ops.py refresh <nb>                       # force re-fetch sections + pages
+
+# Media management (v2 ingest)
+onenote_ops.py fetch-media "<page>" [--all] [--pages-file PATH] [--no-derived]
+onenote_ops.py render-page "<page>"               # write browser-viewable HTML with local image src
+onenote_ops.py gc-media [--dry-run]               # delete orphaned resource bytes
 ```
+
+---
+
+## Strategy: ingest, index, query
+
+### Ingest pipeline
+
+Runs at `fetch-media`, `refresh`, `classify_subjects.py`, and `build_embeddings.py` time. One-shot per item; outputs are cached on disk and reused forever.
+
+| Step | Input | Tool | Output |
+|---|---|---|---|
+| 1. Fetch HTML | OneNote page | Graph API | `cache/page_content/<pid>.html` |
+| 2. Fetch resource bytes | `<img>` / `<object>` refs in HTML | Graph API `/onenote/resources/{id}/content` | `cache/page_resources/<rid>.<ext>` |
+| 3. OCR images | image bytes | **Gemini 2.5 flash** | `<rid>.ocr.txt` (only if ≥30 non-ws chars) |
+| 4. Scene-caption empty-OCR images | image bytes | **Gemini 2.5 flash** | `<rid>.caption.txt` |
+| 5. Transcribe audio/video | media bytes | **Gemini 2.5 flash** | `<rid>.transcript.txt` |
+| 6. Subject classification | page meta + body + OCR | **Gemini 2.5 flash** | `cache/page_subjects.json` (one label per page: `self` / `general` / `<Person>`) |
+| 7. Adaptive chunking | HTML | (local, deterministic) | typed chunks per page |
+| 8. Embedding | text strings + media bytes | **Gemini `gemini-embedding-2-preview`** @ 768d | `cache/embeddings_v2.npz` + `_meta.json` |
+
+Gemini is chosen for steps 3–6 and 8 for economy: flash runs ingest at ~$0.001/item in batch; Claude via paid API would cost ~10×. Steps 1–2 and 7 involve no LLM.
+
+### Chunking policy (step 7)
+
+Per-page chunks in document order, then embedded individually:
+
+- **Text chunks**: headings (`h1`/`h2`) as *hard* boundaries only when the section has ≥500 chars; otherwise the heading becomes a soft marker embedded inline. Paragraphs with ≥3 sentences AND ≥150 non-ws chars get their own chunk; shorter ones pack up to 1.5K chars. Over-sized paragraphs are sliding-window split with 200-char overlap.
+- **Table chunks**: small tables (<1.5K chars) emit one chunk; larger tables produce row-group chunks with the column header re-prefixed. Row-group size adapts to average row body (5–10 rows typical). Cells >1K chars trigger intra-cell windowing with row-context re-prefix.
+- **Media chunks** (per resource): one raw-bytes chunk (image/PDF/audio → multimodal embedding) + sibling text chunks when OCR or caption exists.
+- **Page-summary chunk**: one per page (`kind=summary`) — whole body capped at 5K chars.
+- **Routing header** (prepended to every text chunk): `Notebook / Section / Page / Heading path`. Provides retrieval context beyond the chunk body.
+
+Typical corpus: ~5× chunks per page; ~6K total chunks for ~1.1K pages.
+
+### Index structure
+
+- `cache/embeddings_v2.npz` — `{ids: (N,) str, vectors: (N, 768) float32 L2-normalized, kinds: (N,) str}`.
+- `cache/embeddings_v2_meta.json` — `{model, dim, pages: {page_id: {...}}, chunks: {chunk_id: {kind, page_id, heading_path, resource_id, filename, ...}}}`. No embed text stored — retrieved on-demand by re-chunking a hit page (cached per-session).
+- `cache/page_subjects.json` — `{page_id: subject_label}`; subject_overrides.json can patch specific labels.
+
+All are plain files; no external vector DB. Size: ~22 MB for 5,977 vectors.
+
+### Query pipeline
+
+```
+ query text
+  │
+  ├─► Gemini embed_content ──► 768-d query vector        (~180 ms)
+  │
+  ├─► (local) subject auto-detect: first-person pronouns +
+  │             person names in query → allowed subjects
+  │
+  ├─► matmul (vectors @ query)                           (~1 ms)
+  │
+  ├─► filters: notebook, subject-set, --include-general? (~1 ms)
+  │
+  ├─► top-K pages × max-N chunks/page                    (~1 ms)
+  │
+  └─► return hits with chunk_id, subject tag, heading_path
+```
+
+- **Subject-aware filtering** is default-on and *strict* (person-only). `--include-general` adds general reference pages alongside; used when the query needs reference material to be answerable (how X works, precautions before X, normal ranges, interpretation). The orchestrating Claude harness decides when to pass the flag based on the query; no Gemini call for this decision.
+- **Top-K × max-N** (default 10 × 3): surface up to N matching chunks per page, across K distinct pages. Shows multiple relevant chunks per page when they exist, without one page dominating results.
+- **No re-rank**, no ANN index — exact cosine matmul over ~6K vectors takes ~1 ms.
+
+Typical query latency: **~280 ms** steady state (embed call dominates). Local compute is sub-millisecond.
+
+### Synthesis (when invoked via Claude Code)
+
+Retrieval returns chunk IDs; the orchestrating Claude re-chunks each hit page at query time to pull the matched chunks' exact text (`embed_text`), feeds them as context to itself, and writes the answer with page-level citations. Claude is free via the subscription, instant, and avoids the latency and 503-flakiness of calling Gemini flash as a generator.
+
+### Where LLMs are used — summary
+
+| Role | Model | Economic reasoning |
+|---|---|---|
+| Embedding (build + query) | Gemini `gemini-embedding-2-preview` | Locked to the vector space of the stored index; ~$0.06 for full corpus |
+| Ingest OCR / caption / transcribe / classify | Gemini 2.5 flash | Cheapest paid option at batch scale (~$1–2 one-time) |
+| Query synthesis (RAG answer) | Claude (harness) | Free via subscription, instant, no 503 |
+| Query intent (whether to include general) | Claude (harness) | Free via subscription, accurate without extra API call |
+
+If corpus scale grows 10× or privacy demands on-device: Tesseract (OCR), Whisper (transcribe), and local Ollama (classifier) are viable swaps without touching the embedding path.
 
 ---
 
 ## What gets cached
 
-The skill caches API responses locally for speed:
+The skill caches API responses and derived artifacts locally for speed:
 
+**Graph-fetched source:**
 - `cache/onenote_cache.json` — full notebook/section/page index (never read directly — too large)
-- `cache/page_index.txt` — grep-able title + path index
-- `cache/page_content/` — individual page HTML snapshots (keyed by page ID)
-- `cache/embeddings.npz` — Gemini vectors for every cached page (~4 MB per ~1K pages)
-- `cache/embeddings_meta.json` — per-page `last_modified` + title/notebook/section for incremental rebuilds and query-time metadata
+- `cache/page_index.txt` — grep-able title + path index rebuilt from the above
+- `cache/page_content/<safe_pid>.html` + `.meta` — individual page HTML snapshots, invalidated by `last_modified`
+- `cache/page_resources/<safe_rid>.<ext>` — raw image / PDF / audio / video bytes fetched from Graph `/onenote/resources/{id}/content`
+- `cache/page_resources/<safe_rid>.meta.json` — `{mime, filename, kind, size, fetched_at, page_ids: [...]}` per resource
+
+**LLM-derived artifacts (one-shot per item, reused forever):**
+- `cache/page_resources/<safe_rid>.ocr.txt` — Gemini-flash OCR of images (when ≥30 non-ws chars)
+- `cache/page_resources/<safe_rid>.caption.txt` — Gemini-flash scene caption (only when OCR empty)
+- `cache/page_resources/<safe_rid>.transcript.txt` — Gemini-flash transcript for audio/video
+- `cache/page_subjects.json` — per-page classification: `self` / `general` / `<Person>`; used for subject-aware query filtering
+- `cache/subject_overrides.json` (optional) — manual overrides; takes precedence
+
+**Embedding index (v2, chunked + multimodal, 768d):**
+- `cache/embeddings_v2.npz` — `{ids, vectors, kinds}` — one row per chunk (text / summary / image / image_ocr / image_caption / pdf / audio / video_transcript)
+- `cache/embeddings_v2_meta.json` — per-chunk metadata (page_id, heading_path, resource_id, filename, char_count, source) + per-page `last_modified` for incremental rebuilds
+
+**Legacy v1 embeddings** (page-level, text-only, superseded by v2):
+- `cache/embeddings.npz` + `cache/embeddings_meta.json` — still built by `build_embeddings.py` without `--v2` flag; safe to delete once v2 is in use
 
 Sync runtime state (also under `cache/`, gitignored):
 

@@ -173,7 +173,10 @@ async def get_section_modified(client, section_id: str) -> str:
 async def list_pages(client, section_id: str) -> list[dict]:
     pages = await client.me.onenote.sections.by_onenote_section_id(section_id).pages.get()
     return [
-        {"id": p.id, "title": p.title, "last_modified": str(p.last_modified_date_time)}
+        {"id": p.id, "title": p.title,
+         "last_modified": str(p.last_modified_date_time),
+         "level": getattr(p, "level", 0) or 0,
+         "order": getattr(p, "order", 0) or 0}
         for p in (pages.value or [])
     ]
 
