@@ -8,6 +8,7 @@ onenote/scripts/benchmark_results.json
 # Personal cache data — never commit
 onenote/cache/
 office/cache/
+onenote/*.zip
 
 # Python
 __pycache__/
