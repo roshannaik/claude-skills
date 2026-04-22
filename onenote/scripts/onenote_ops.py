@@ -232,8 +232,16 @@ async def main_async(args):
 
     # Commands that never need a Graph client: find_page lazy-creates one only
     # on cache miss; the rest are pure local (read cache, call Gemini, etc.).
-    if args.cmd in ('read-page', 'read-page-html', 'gc-media', 'render-page',
-                    'query', 'search-title', 'search-content'):
+    # fetch-media --status/--unstick are diagnostic only; they also skip the
+    # client to avoid triggering auth when the user just wants to check/clear
+    # a stuck lock.
+    skip_client = (args.cmd in ('read-page', 'read-page-html', 'gc-media',
+                                 'render-page', 'query', 'search-title',
+                                 'search-content')
+                   or (args.cmd == 'fetch-media'
+                       and (getattr(args, 'status', False)
+                            or getattr(args, 'unstick', False))))
+    if skip_client:
         client = None
     else:
         from onenote_setup import make_graph_client
@@ -270,6 +278,24 @@ async def main_async(args):
         print(f"Refreshed '{args.notebook}': {stats['sections']} sections, {stats['pages']} pages")
 
     elif args.cmd == 'fetch-media':
+        from onenote_lock import (
+            ProcessLock, LockHeldError, unstick, read_lock_body, is_locked,
+        )
+
+        # Diagnostic / recovery modes — don't hold the lock, don't fetch.
+        if args.status:
+            if is_locked('fetch_media'):
+                body = read_lock_body('fetch_media')
+                print(f"fetch-media running: pid={body.get('pid','?')} "
+                      f"host={body.get('hostname','?')} started={body.get('started_at','?')}")
+            else:
+                print('fetch-media: idle')
+            return
+        if args.unstick:
+            result = unstick('fetch_media')
+            print(f"unstick: {result}")
+            return
+
         # Resolve the target page set
         rows = []
         if args.all:
@@ -297,11 +323,17 @@ async def main_async(args):
             if not rows:
                 return
 
-        summaries = []
-        for row in rows:
-            summary = await _fetch_media_one(client, row, skip_derived=args.no_derived)
-            summaries.append(summary)
-        _print_media_summary(summaries)
+        try:
+            with ProcessLock('fetch_media'):
+                summaries = []
+                for row in rows:
+                    summary = await _fetch_media_one(client, row,
+                                                      skip_derived=args.no_derived)
+                    summaries.append(summary)
+                _print_media_summary(summaries)
+        except LockHeldError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
 
     elif args.cmd == 'render-page':
         rows = []
@@ -394,6 +426,12 @@ if __name__ == '__main__':
                    help='Fetch media for every cached page')
     p.add_argument('--no-derived', action='store_true',
                    help='Skip OCR / transcription; just fetch raw bytes')
+    p.add_argument('--status', action='store_true',
+                   help='Report whether a fetch-media run is currently active '
+                        '(owner pid + start time from the lockfile) and exit.')
+    p.add_argument('--unstick', action='store_true',
+                   help='SIGTERM (then SIGKILL after 5s) a hung fetch-media '
+                        'owner process to release the lock, then exit.')
 
     p = sub.add_parser('render-page',
                        help='Write browser-viewable HTML with images rewritten to local file:// URIs')

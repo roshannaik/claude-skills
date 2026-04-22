@@ -84,12 +84,24 @@ To uninstall:
 ./onenote/uninstall.sh
 ```
 
+### `$SKILL_ROOT` convention
+
+CLI examples in this README reference `$SKILL_ROOT/onenote/...`. Export it once to match your harness's skill install:
+
+```bash
+# Claude Code
+export SKILL_ROOT=~/.claude/skills
+
+# openclaw
+# export SKILL_ROOT=~/.openclaw/workspace/skills
+```
+
 ---
 
 ## First-time authentication
 
 ```bash
-python3 ~/Projects/skills/onenote/scripts/onenote_setup.py
+python3 $SKILL_ROOT/onenote/scripts/onenote_setup.py
 ```
 
 This prints a device code and a URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.
@@ -136,9 +148,9 @@ Newly shared notebooks need to be opened at least once in OneNote (web, desktop,
 ### Manual sync
 
 ```bash
-python3 ~/Projects/skills/onenote/scripts/sync.py                  # sync now
-python3 ~/Projects/skills/onenote/scripts/sync.py status           # idle / running
-python3 ~/Projects/skills/onenote/scripts/sync.py unstick          # kill a hung sync
+python3 $SKILL_ROOT/onenote/scripts/sync.py                  # sync now
+python3 $SKILL_ROOT/onenote/scripts/sync.py status           # idle / running
+python3 $SKILL_ROOT/onenote/scripts/sync.py unstick          # kill a hung sync
 ```
 
 Only one sync runs at a time (enforced by `fcntl.flock`), so it's safe to invoke from any harness, cron, launchd, or a keystroke. The kernel releases the lock when the process dies — stale lockfiles can't block future runs.

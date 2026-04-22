@@ -30,12 +30,20 @@ metadata:
 
 # OneNote Skill
 
+## Path convention
+
+All paths below are written as `$SKILL_ROOT/onenote/...`. `$SKILL_ROOT` is the harness's skills directory:
+- **Claude Code**: `~/.claude/skills`
+- **openclaw**:    `~/.openclaw/workspace/skills`
+
+When constructing shell commands, expand `$SKILL_ROOT` to the actual path for your harness.
+
 ## Setup
 
-- Auth + Graph client:   `~/Projects/skills/onenote/scripts/onenote_setup.py`
-- Main CLI:              `~/Projects/skills/onenote/scripts/onenote_ops.py`
+- Auth + Graph client:   `$SKILL_ROOT/onenote/scripts/onenote_setup.py`
+- Main CLI:              `$SKILL_ROOT/onenote/scripts/onenote_ops.py`
 - Token cache:           `~/.cache/ms_graph_token_cache.json` (no login needed)
-- Cache layout (`~/Projects/skills/onenote/cache/`):
+- Cache layout (`$SKILL_ROOT/onenote/cache/`):
   - `onenote_cache.json` — notebook/section/page index (**never read directly**)
   - `page_index.txt` — grep-able `title\tnotebook\tsection\tpage_id`
   - `page_content/*.html` + `.meta` — HTML snapshots keyed by page ID
@@ -65,7 +73,7 @@ Escalate only as needed.
 **Always pass `--v2`** — it's chunked + multimodal (hits image OCR, scene captions, audio transcripts, page summaries, headings, and table row-groups). The v1 path without `--v2` still works but is page-level text-only and should not be preferred.
 
 ```bash
-python3 ~/Projects/skills/onenote/scripts/onenote_ops.py query --v2 "<query>" \
+python3 $SKILL_ROOT/onenote/scripts/onenote_ops.py query --v2 "<query>" \
     [--top-k 10] [--max-n 3] [--notebook NB] [--subject LIST] [--include-general] [--no-subject-filter]
 ```
 
@@ -111,6 +119,8 @@ Use the matched chunks (via `onenote_chunks.chunk_page(...)` → look up by `chu
 **Citation format:** `Page Title — Notebook / Section [subject-if-non-general]`.
 - *Tea tannin composition — Health / Colitis / Good/Bad Foods [self]*
 - *S3 durability — Interviews / System Design / Cloud Obj store (S3/GCS)* (no tag — general)
+
+**Harnesses without an LLM:** The script does retrieval only; synthesis and the `--include-general` decision depend on a harness-level LLM. When invoked from a plain shell or a non-LLM automation, output the CLI rows directly; the caller supplies `--include-general` / `--strict-subject` / `--subject` explicitly.
 
 ---
 
@@ -171,7 +181,8 @@ For questions spanning multiple pages — fetches run concurrently:
 
 ```python
 import asyncio, sys
-sys.path.insert(0, str(__import__('pathlib').Path.home() / 'Projects/skills/onenote/scripts'))
+import os
+sys.path.insert(0, os.path.expandvars('$SKILL_ROOT/onenote/scripts'))
 from onenote_setup import make_graph_client
 from onenote_ops import find_pages_batch, refresh_all_notebooks
 
@@ -206,6 +217,10 @@ python3 scripts/build_embeddings.py --v2 --force
 python3 scripts/onenote_ops.py fetch-media "<page>"        # one page
 python3 scripts/onenote_ops.py render-page "<page>"        # browser-viewable HTML w/ local image srcs
 python3 scripts/onenote_ops.py gc-media [--dry-run]        # drop orphaned resource bytes
+
+# Concurrency / zombie recovery (fetch-media holds an fcntl lock)
+python3 scripts/onenote_ops.py fetch-media --status        # show owner pid/start time, or idle
+python3 scripts/onenote_ops.py fetch-media --unstick       # SIGTERM (then SIGKILL @5s) a hung owner
 ```
 
 All three ingest steps are incremental — unchanged content is carried forward via `last_modified` checks. First full build ≈ $2 of paid-tier Gemini usage; incremental refreshes are pennies.
