@@ -390,6 +390,26 @@ onenote_ops.py query "<sharper query referencing specifics from $hit>" \
 
 ---
 
+## Scripts reference
+
+All scripts live under `scripts/` as plain Python modules — no `__init__.py`, no package wrapping. The four marked **entry point** below are the only ones a user or integrator invokes directly; the rest are imported.
+
+| Script | Kind | Purpose |
+|---|---|---|
+| `onenote_setup.py` | entry point | MSAL device-code auth + token cache at `~/.cache/ms_graph_token_cache.json`. `make_graph_client()` is the only thing other modules import from it. |
+| `onenote_ops.py` | entry point | Main CLI. Thin dispatcher over the library modules; also re-exports their public names for inline-Python callers (`from onenote_ops import find_page, semantic_search, ...`). |
+| `build_embeddings.py` | entry point | Standalone CLI wrapper over `onenote_embeddings.build_embeddings`. Used for manual index (re)builds and called by `sync.py`. Supports `--force`, subset build by page_id list or notebook. |
+| `classify_subjects.py` | entry point | One-off (+ incremental) per-page subject classifier (`self` / `general` / `<Person>`) using Gemini flash. Writes `cache/page_subjects.json`; `cache/subject_overrides.json` patches specific labels at query time. |
+| `sync.py` | entry point | Single-shot cache sync: detects dirty notebooks via `last_modified`, refreshes only those, prunes deleted-page HTML, triggers incremental embedding rebuild. fcntl-locked + SIGALRM self-kill. Subcommands: `sync` (default), `status`, `unstick`. Designed to be safe from cron / launchd / keystroke. |
+| `onenote_api.py` | library | Graph API read ops: `get_notebooks`, `get_sections`, `get_pages`, `refresh_notebook`, `refresh_all_notebooks`, `find_page`, `find_pages_batch`. Uses `last_modified` to skip unchanged re-fetches. |
+| `onenote_cache.py` | library | Disk cache layer: `onenote_cache.json` (notebook/section/page tree), `page_index.txt` (grep-able), per-page HTML snapshots, lookup helpers, atomic writes, `strip_html`. |
+| `onenote_chunks.py` | library | Adaptive mechanical chunker. Walks top-level HTML blocks, paragraph-packs short text, row-atomic chunks for tables, emits typed `Chunk` objects (text / summary / image / image_ocr / image_caption / pdf / audio / video_transcript / audio_transcript). Deterministic — same HTML always produces the same chunk IDs. |
+| `onenote_embeddings.py` | library | Gemini embeddings build + query. Unified text+media vector space (`gemini-embedding-2-preview` @ 768d). Public API: `semantic_search`, `query_by_page`, `get_chunk_text`, `build_embeddings`. |
+| `onenote_genai.py` | library | Shared Gemini client (`get_client`) + `with_retry` exponential backoff on 429 / 503 / `RESOURCE_EXHAUSTED`. Every other module's LLM call goes through it. |
+| `onenote_lock.py` | library | `fcntl.flock`-based process lock with lockfile body carrying `{pid, started_at, hostname}` so `unstick` can SIGTERM/SIGKILL a hung owner. Used by `fetch-media` and `sync`. |
+| `onenote_media.py` | library | Resource fetch pipeline: downloads images/PDFs/audio/video from Graph, runs Gemini-flash OCR (+ scene caption fallback when OCR empty) on images, transcribes audio/video. Also `gc_media` (orphan cleanup) and `render_hydrated_html` (browser-viewable HTML with `file://` srcs). |
+| `onenote_search.py` | library | Pure-local title grep (`search_pages`) and HTML grep (`search_content`) over the cached index — no API, no embeddings. |
+
 ## Strategy: ingest, index, query
 
 ### Ingest pipeline
