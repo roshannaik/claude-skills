@@ -14,9 +14,10 @@ Strategy (see chunked_embeddings_plan.md for rationale):
 - Heading density awareness: a heading is a HARD chunk boundary only if its
   section accumulates >=HEADING_HARD_MIN_CHARS (500); otherwise the heading is
   a SOFT marker embedded inline in the active pack.
-- Tables: small (<1.5K total) -> one chunk; otherwise row-group chunks with
-  adaptive group size (derived from avg row body). Any cell >1K chars triggers
-  intra-cell paragraph windowing with row-context re-prefix.
+- Tables: small (<=TABLE_SMALL_CHAR_CAP) -> one chunk; otherwise one chunk per
+  row, with nested tables serialized inline inside the parent row. A single
+  row that exceeds CHUNK_HARD_MAX_CHARS is sliding-window split, with the
+  row's label (first cell) prefixed to every window.
 - Date-block detection: a paragraph starting with a date token starts a new
   "entry" that stays together under packing.
 - Media chunks: one per resource (image/pdf/audio raw bytes) + image_ocr
@@ -47,8 +48,6 @@ PARA_OWN_CHUNK_MIN_CHARS   = 150    # ... AND >= this many non-ws chars
 HEADING_HARD_MIN_CHARS     = 500    # heading becomes hard boundary if section >= this
 SUMMARY_CHAR_CAP           = 5000   # page-summary body cap
 TABLE_SMALL_CHAR_CAP       = 1500   # table treated as single chunk if body <= this
-ROW_GROUP_BODY_TARGET      = 1000   # target body chars per row-group chunk
-CELL_LARGE_CHAR_THRESHOLD  = 1000   # cell >= this triggers intra-cell windowing
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +58,56 @@ _DIV_OPEN  = re.compile(r'<div\b[^>]*>',       re.I)
 _DIV_CLOSE = re.compile(r'</div>',              re.I)
 _H_TAG     = re.compile(r'<(h[1-4])\b[^>]*>(.*?)</\1>', re.I | re.S)
 _P_TAG     = re.compile(r'<p\b[^>]*>(.*?)</p>',        re.I | re.S)
-_TABLE_TAG = re.compile(r'<table\b[^>]*>(.*?)</table>',re.I | re.S)
 _LIST_TAG  = re.compile(r'<(ul|ol)\b[^>]*>(.*?)</\1>', re.I | re.S)
 _HR_TAG    = re.compile(r'<hr\b[^>]*/?>',              re.I)
-_TR_TAG    = re.compile(r'<tr\b[^>]*>(.*?)</tr>',      re.I | re.S)
-_TD_TAG    = re.compile(r'<t([dh])\b[^>]*>(.*?)</t\1>',re.I | re.S)
 _LI_TAG    = re.compile(r'<li\b[^>]*>(.*?)</li>',      re.I | re.S)
 _BOLD_ONLY = re.compile(r'^\s*<(b|strong|span[^>]*font-weight:\s*bold[^>]*)>(.+?)</\1>\s*$', re.I | re.S)
+
+# Balanced-tag scanning for table / tr / td — non-greedy regex can't handle
+# nested same-tag structures (e.g. an outer <table> row containing a nested
+# <table> in a cell). The scanner below tracks open/close depth so outer
+# occurrences aren't truncated at the first inner closer.
+_BAL_PATS: dict = {}
+
+def _bal_pat(tag: str) -> tuple:
+    pair = _BAL_PATS.get(tag)
+    if pair is None:
+        pair = (re.compile(rf'<{tag}\b[^>]*?(/?)>', re.I),
+                re.compile(rf'</{tag}\s*>',         re.I))
+        _BAL_PATS[tag] = pair
+    return pair
+
+
+def _balanced_tag_spans(html: str, tag: str):
+    """Yield (open_tag_start, close_tag_end, inner_start, inner_end) for each
+    top-level <tag>...</tag> block, respecting nested same-tag pairs."""
+    open_pat, close_pat = _bal_pat(tag)
+    pos = 0
+    while True:
+        m = open_pat.search(html, pos)
+        if not m:
+            return
+        if m.group(1) == '/':  # self-closing; no body
+            pos = m.end()
+            continue
+        open_start  = m.start()
+        inner_start = m.end()
+        depth = 1
+        p = inner_start
+        while depth > 0:
+            nm = open_pat.search(html, p)
+            cm = close_pat.search(html, p)
+            if not cm:
+                return  # malformed; give up
+            if nm and nm.start() < cm.start() and nm.group(1) != '/':
+                depth += 1
+                p = nm.end()
+            else:
+                depth -= 1
+                p = cm.end()
+                if depth == 0:
+                    yield (open_start, p, inner_start, cm.start())
+        pos = p
 
 _SENT_END  = re.compile(r'[.!?]+(?=\s|$)')
 _WS        = re.compile(r'\s+')
@@ -128,8 +170,9 @@ def _extract_blocks(html: str) -> list:
         hits.append((m.start(), m.end(), 'heading', m.group(1).lower(), m.group(2)))
     for m in _P_TAG.finditer(html):
         hits.append((m.start(), m.end(), 'para', 'p', m.group(1)))
-    for m in _TABLE_TAG.finditer(html):
-        hits.append((m.start(), m.end(), 'table', 'table', m.group(1)))
+    for open_start, close_end, inner_start, inner_end in _balanced_tag_spans(html, 'table'):
+        hits.append((open_start, close_end, 'table', 'table',
+                     html[inner_start:inner_end]))
     for m in _LIST_TAG.finditer(html):
         hits.append((m.start(), m.end(), 'list', m.group(1).lower(), m.group(2)))
     for m in _HR_TAG.finditer(html):
@@ -200,27 +243,59 @@ def _build_routing_header(page_meta: dict,
 # ---------------------------------------------------------------------------
 # Table handling
 # ---------------------------------------------------------------------------
+#
+# Policy: rows are atomic chunks. Small tables (whole body <= 1.5K) are one
+# chunk; otherwise one chunk per row. Nested tables inside a cell are
+# serialized inline so they travel with the parent row. Single pathologically-
+# fat rows (>CHUNK_HARD_MAX_CHARS) are sliding-window split, but every window
+# is prefixed with the row's first-cell content so its row label (typically a
+# date or subject) rides along.
 
 def _parse_table(table_html: str) -> tuple:
-    """Return (rows, header_row). rows/header_row are lists of cell strings.
+    """Return (rows, header_row) using balanced <tr>/<td> scanning.
 
-    Heuristic: if the first row is all <th> or contains 'bold' styling markers,
-    treat it as header; otherwise no header."""
+    - Header row = first row where every cell is <th>.
+    - Nested <table>s inside a cell are serialized as inline text so they
+      stay with the parent row.
+    - Each cell's text is cleaned / whitespace-collapsed.
+    """
     rows = []
     header = None
-    for m in _TR_TAG.finditer(table_html):
-        cells_raw = [(c_kind, c_html) for c_kind, c_html in _TD_TAG.findall(m.group(1))]
-        cell_texts = [_clean(h) for _, h in cells_raw]
-        is_header_row = all(k == 'h' for k, _ in cells_raw) and cells_raw
+    for _, _, tr_inner_start, tr_inner_end in _balanced_tag_spans(table_html, 'tr'):
+        row_html = table_html[tr_inner_start:tr_inner_end]
+        cells_raw = []  # list of (doc_pos, kind: 'd'|'h', cell_text)
+        for kind in ('td', 'th'):
+            for open_start, _close_end, inner_start, inner_end in _balanced_tag_spans(row_html, kind):
+                cell_html = row_html[inner_start:inner_end]
+                cells_raw.append((open_start, kind[-1], _serialize_cell_html(cell_html)))
+        cells_raw.sort(key=lambda t: t[0])
+        cells_text = [text for _, _, text in cells_raw]
+        kinds      = [k    for _, k, _ in cells_raw]
+        is_header_row = bool(cells_raw) and all(k == 'h' for k in kinds)
         if header is None and is_header_row:
-            header = cell_texts
+            header = cells_text
         else:
-            rows.append(cell_texts)
+            rows.append(cells_text)
     return rows, (header or [])
 
 
+def _serialize_cell_html(cell_html: str) -> str:
+    """Cell content → flat text. Nested <table>s are expanded inline so the
+    nested rows stay with the parent row's chunk."""
+    out  = []
+    last = 0
+    for open_start, close_end, inner_start, inner_end in _balanced_tag_spans(cell_html, 'table'):
+        out.append(cell_html[last:open_start])
+        nested_rows, nested_header = _parse_table(cell_html[inner_start:inner_end])
+        if nested_rows:
+            out.append(f'\n{_serialize_rows_block(nested_header, nested_rows)}\n')
+        last = close_end
+    out.append(cell_html[last:])
+    return _clean(''.join(out))
+
+
 def _serialize_row(header: list, row: list) -> str:
-    """Markdown-ish single-row serialization: 'Col1: val1 | Col2: val2 | ...'."""
+    """Single-row serialization: 'Col1: val1 | Col2: val2 | ...'."""
     if header:
         pairs = [f"{h}: {v}" for h, v in zip(header, row) if v]
     else:
@@ -235,7 +310,8 @@ def _header_reprefix(header: list) -> str:
 
 
 def _serialize_rows_block(header: list, rows: list) -> str:
-    """Full markdown table for a group of rows."""
+    """Markdown-ish table for a group of rows, used when emitting multi-row
+    chunks (small-table path) or nested tables inline inside a cell."""
     if header:
         cols = '| ' + ' | '.join(header) + ' |'
         sep  = '|' + '|'.join(['---'] * len(header)) + '|'
@@ -245,21 +321,34 @@ def _serialize_rows_block(header: list, rows: list) -> str:
     return '\n'.join(_serialize_row([], r) for r in rows)
 
 
+def _row_label(row: list) -> str:
+    """First non-empty cell, treated as the row's anchor (date / key / name).
+    Used to re-prefix window-split chunks so the anchor isn't lost."""
+    for cell in row:
+        txt = cell.strip()
+        if txt:
+            return txt[:120]
+    return ''
+
+
 def _chunk_table(page_id: str, table_html: str,
                  page_meta: dict, heading_path: list,
                  seq_start: int) -> tuple:
-    """Chunk a single table. Returns (chunks, next_seq)."""
+    """Chunk a single table. Returns (chunks, next_seq).
+
+    Small tables emit one chunk for the whole table. Larger tables emit one
+    chunk PER ROW — nested content inside cells is serialized inline so the
+    row is self-contained (date labels in cell 0 travel with the row).
+    """
     rows, header = _parse_table(table_html)
     if not rows:
         return [], seq_start
 
     full_body = _serialize_rows_block(header, rows)
-    full_len  = len(full_body)
-    chunks    = []
-    seq       = seq_start
+    chunks = []
+    seq = seq_start
 
-    # Small-table short-circuit
-    if full_len <= TABLE_SMALL_CHAR_CAP:
+    if len(full_body) <= TABLE_SMALL_CHAR_CAP:
         routing = _build_routing_header(page_meta, heading_path, [])
         text = routing + full_body
         chunks.append(Chunk(
@@ -273,91 +362,16 @@ def _chunk_table(page_id: str, table_html: str,
         ))
         return chunks, seq + 1
 
-    # Detect oversized cells triggering intra-cell windowing
-    def _has_big_cell(r):
-        return any(len(c) > CELL_LARGE_CHAR_THRESHOLD for c in r)
-
-    # Group rows by adaptive size (rows fit until body target is hit)
-    i = 0
-    while i < len(rows):
-        if _has_big_cell(rows[i]):
-            # emit intra-cell-windowed chunks for this row alone
-            chunks_row, seq = _chunk_big_row(page_id, rows[i], header,
-                                             page_meta, heading_path, seq)
-            chunks.extend(chunks_row)
-            i += 1
+    # Row-atomic: one chunk per row.
+    routing     = _build_routing_header(page_meta, heading_path, [])
+    body_header = _header_reprefix(header)
+    for row in rows:
+        row_body = _serialize_row(header, row)
+        if not row_body.strip():
             continue
 
-        group = []
-        body_len = 0
-        while i < len(rows) and not _has_big_cell(rows[i]):
-            row_str = _serialize_row(header, rows[i])
-            # +1 for newline between rows
-            if group and body_len + 1 + len(row_str) > ROW_GROUP_BODY_TARGET:
-                break
-            group.append(rows[i])
-            body_len += (1 if group else 0) + len(row_str)
-            i += 1
-            if body_len >= ROW_GROUP_BODY_TARGET:
-                break
-        if not group:
-            break
-
-        routing = _build_routing_header(page_meta, heading_path, [])
-        body = _header_reprefix(header) + _serialize_rows_block(header, group)
-        text = routing + body
-        chunks.append(Chunk(
-            chunk_id   = f'{page_id}#t{seq:04d}',
-            kind       = 'text',
-            page_id    = page_id,
-            embed_text = text,
-            heading_path = list(heading_path),
-            char_count = len(text),
-            extra      = {'source': 'table_row_group', 'rows': len(group)},
-        ))
-        seq += 1
-
-    return chunks, seq
-
-
-def _chunk_big_row(page_id: str, row: list, header: list,
-                   page_meta: dict, heading_path: list,
-                   seq_start: int) -> tuple:
-    """Intra-cell windowing: one row with at least one cell >1K chars.
-
-    Each sub-chunk carries:
-      - column header re-prefix
-      - compact one-line summary of the row's small cells
-      - the big cell's content split into ~1.5K windows (with overlap)
-    """
-    seq = seq_start
-    chunks = []
-
-    # Identify the big cells; small cells form the compact row context
-    small_parts = []
-    big_cells   = []  # (col_idx, content)
-    for idx, cell in enumerate(row):
-        col = header[idx] if idx < len(header) else f'col{idx+1}'
-        if len(cell) > CELL_LARGE_CHAR_THRESHOLD:
-            big_cells.append((idx, col, cell))
-        elif cell:
-            small_parts.append(f"{col}: {cell}")
-    row_context = ' | '.join(small_parts)
-
-    # Split each big cell using sliding window
-    for idx, col, cell in big_cells:
-        start = 0
-        part_n = 0
-        while start < len(cell):
-            end = min(start + CHUNK_TARGET_CHARS, len(cell))
-            slice_text = cell[start:end]
-            part_n += 1
-            routing = _build_routing_header(page_meta, heading_path, [])
-            body = (_header_reprefix(header)
-                    + (f"[Row context] {row_context}\n" if row_context else '')
-                    + f"[Column: {col}  part {part_n}]\n"
-                    + slice_text)
-            text = routing + body
+        if len(row_body) <= CHUNK_HARD_MAX_CHARS:
+            text = routing + body_header + row_body
             chunks.append(Chunk(
                 chunk_id   = f'{page_id}#t{seq:04d}',
                 kind       = 'text',
@@ -365,12 +379,30 @@ def _chunk_big_row(page_id: str, row: list, header: list,
                 embed_text = text,
                 heading_path = list(heading_path),
                 char_count = len(text),
-                extra      = {'source': 'table_cell_window', 'column': col, 'part': part_n},
+                extra      = {'source': 'table_row'},
             ))
             seq += 1
-            if end >= len(cell):
-                break
-            start = end - WINDOW_OVERLAP_CHARS
+            continue
+
+        # Pathologically fat single row: sliding-window split, but every
+        # window carries the row label (first non-empty cell) so the anchor
+        # (e.g., date) rides with every piece.
+        label = _row_label(row)
+        for part_n, slice_text in enumerate(_split_oversized_paragraph(row_body), 1):
+            label_line = f"[Row: {label}  part {part_n}]\n" if label else \
+                         f"[part {part_n}]\n"
+            text = routing + body_header + label_line + slice_text
+            chunks.append(Chunk(
+                chunk_id   = f'{page_id}#t{seq:04d}',
+                kind       = 'text',
+                page_id    = page_id,
+                embed_text = text,
+                heading_path = list(heading_path),
+                char_count = len(text),
+                extra      = {'source': 'table_row_window',
+                              'row_label': label, 'part': part_n},
+            ))
+            seq += 1
 
     return chunks, seq
 
