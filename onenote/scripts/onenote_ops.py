@@ -191,43 +191,32 @@ async def main_async(args):
         return
 
     if args.cmd == 'query':
-        if args.v2:
-            from onenote_embeddings_v2 import semantic_search as semantic_search_v2
-            subj_list = None
-            if args.subject:
-                # comma-split
-                subj_list = [s.strip() for s in args.subject.split(',') if s.strip()]
-            pages = semantic_search_v2(args.query,
-                                        top_k_pages=args.top_k,
-                                        max_n_per_page=args.max_n,
-                                        notebook=args.notebook,
-                                        subject=subj_list,
-                                        no_subject_filter=args.no_subject_filter,
-                                        include_general=args.include_general)
-            if not pages:
-                print('No results.')
-                return
-            detected = pages[0].get('_detected_subjects') if pages else None
-            ig_used = pages[0].get('_include_general') if pages else None
-            if detected:
-                general_note = ' + general' if ig_used else ''
-                print(f"[filter: subject ∈ {{{', '.join(detected)}}}{general_note}]")
-            for p in pages:
-                best = p['chunks'][0]['score']
-                subj_note = f"  [{p.get('subject','')}]" if p.get('subject') else ''
-                print(f"{best:.3f}  {p['title']}  |  {p['notebook']} / {p['section']}{subj_note}")
-                for c in p['chunks']:
-                    hp = ' > '.join(c.get('heading_path', []) or [])
-                    hp_note = f'  ({hp})' if hp else ''
-                    print(f"       {c['score']:.3f}  {c['kind']:17s} {c['snippet']}{hp_note}")
-            return
-
-        hits = semantic_search(args.query, top_k=args.top_k, notebook=args.notebook)
-        if not hits:
+        subj_list = None
+        if args.subject:
+            subj_list = [s.strip() for s in args.subject.split(',') if s.strip()]
+        pages = semantic_search(args.query,
+                                top_k_pages=args.top_k,
+                                max_n_per_page=args.max_n,
+                                notebook=args.notebook,
+                                subject=subj_list,
+                                no_subject_filter=args.no_subject_filter,
+                                include_general=args.include_general)
+        if not pages:
             print('No results.')
             return
-        for h in hits:
-            print(f"{h['score']:.3f}  {h['title']}  |  {h['notebook']} / {h['section']}")
+        detected = pages[0].get('_detected_subjects') if pages else None
+        ig_used = pages[0].get('_include_general') if pages else None
+        if detected:
+            general_note = ' + general' if ig_used else ''
+            print(f"[filter: subject ∈ {{{', '.join(detected)}}}{general_note}]")
+        for p in pages:
+            best = p['chunks'][0]['score']
+            subj_note = f"  [{p.get('subject','')}]" if p.get('subject') else ''
+            print(f"{best:.3f}  {p['title']}  |  {p['notebook']} / {p['section']}{subj_note}")
+            for c in p['chunks']:
+                hp = ' > '.join(c.get('heading_path', []) or [])
+                hp_note = f'  ({hp})' if hp else ''
+                print(f"       {c['score']:.3f}  {c['kind']:17s} {c['snippet']}{hp_note}")
         return
 
     # Commands that never need a Graph client: find_page lazy-creates one only
@@ -450,25 +439,23 @@ if __name__ == '__main__':
                    help='Report what would be deleted without deleting')
 
     p = sub.add_parser('query',
-                       help='Semantic search across all pages using Gemini embeddings')
+                       help='Chunked multimodal semantic search over all cached pages')
     p.add_argument('query', help='Natural language query')
     p.add_argument('--top-k', type=int, default=10, dest='top_k',
                    help='Number of pages to return (default 10)')
     p.add_argument('--max-n', type=int, default=3, dest='max_n',
-                   help='[v2] Max chunks per page in results (default 3)')
+                   help='Max chunks per page in results (default 3)')
     p.add_argument('--notebook', metavar='NOTEBOOK',
                    help='Restrict search to a single notebook (case-insensitive)')
-    p.add_argument('--v2', action='store_true',
-                   help='Use chunked + multimodal v2 embeddings')
     p.add_argument('--subject', metavar='LIST',
-                   help='[v2] Comma-separated subject labels (self, Dad, Mom, ...) '
+                   help='Comma-separated subject labels (self, Dad, Mom, ...) '
                         'to restrict results. Overrides auto-detection. Use "all" '
                         'to disable filtering.')
     p.add_argument('--no-subject-filter', action='store_true',
-                   help='[v2] Disable automatic subject-aware filtering')
+                   help='Disable automatic subject-aware filtering')
     p.add_argument('--include-general', action='store_true',
-                   help="[v2] Also include general reference pages alongside "
-                        "person-specific ones. Default is strict (person-only).")
+                   help='Also include general reference pages alongside '
+                        'person-specific ones. Default is strict (person-only).')
 
     args = parser.parse_args()
 

@@ -50,10 +50,9 @@ When constructing shell commands, expand `$SKILL_ROOT` to the actual path for yo
   - `page_resources/<rid>.{png,jpg,pdf,mp4,…}` + `.meta.json` — media bytes
   - `page_resources/<rid>.ocr.txt` / `.caption.txt` / `.transcript.txt` — derived text
   - `page_subjects.json` — per-page subject label (`self` / `general` / `<Person>`)
-  - `embeddings_v2.npz` + `embeddings_v2_meta.json` — chunked multimodal index (768d)
-  - `embeddings.npz` (+`_meta.json`) — legacy v1 page-level index (optional)
+  - `embeddings.npz` + `embeddings_meta.json` — chunked multimodal index (768d)
 
-Requires `GEMINI_API_KEY` for semantic search. V2 uses `gemini-embedding-2-preview` @ 768d with a unified text+image+PDF+audio vector space.
+Requires `GEMINI_API_KEY` for semantic search. Uses `gemini-embedding-2-preview` @ 768d with a unified text+image+PDF+audio vector space.
 
 ---
 
@@ -63,17 +62,17 @@ Escalate only as needed.
 
 | Tier | When | Cost | Command |
 |---|---|---|---|
-| **1. Semantic search (v2)** | Natural-language question, conceptual topic, "what do my notes say about X". Surfaces both text and embedded media (images, PDFs, audio, video). | 1 Gemini embed call (~180–300 ms steady) | `onenote_ops.py query --v2 "<query>"` |
+| **1. Semantic search** | Natural-language question, conceptual topic, "what do my notes say about X". Surfaces both text and embedded media (images, PDFs, audio, video). | 1 Gemini embed call (~180–300 ms steady) | `onenote_ops.py query "<query>"` |
 | **2. Title search** | User named a page or you know the exact title | instant, no API | `onenote_ops.py search-title "<title>"` |
 | **3. Content grep** | Exact keyword over cached page HTML | ~100 ms, no API | `onenote_ops.py search-content "<keyword>"` |
 | **4. Full page read** | After routing via a tier above | 1 API call first time, cached after | `onenote_ops.py read-page <nb> <sec> <page>` |
 
 ### Semantic search (Tier 1) — primary fast path
 
-**Always pass `--v2`** — it's chunked + multimodal (hits image OCR, scene captions, audio transcripts, page summaries, headings, and table row-groups). The v1 path without `--v2` still works but is page-level text-only and should not be preferred.
+Chunked + multimodal: each query hits text chunks, page summaries, image OCR, scene captions, raw image/PDF/audio vectors, and audio/video transcripts in one unified 768-d space.
 
 ```bash
-python3 $SKILL_ROOT/onenote/scripts/onenote_ops.py query --v2 "<query>" \
+python3 $SKILL_ROOT/onenote/scripts/onenote_ops.py query "<query>" \
     [--top-k 10] [--max-n 3] [--notebook NB] [--subject LIST] [--include-general] [--no-subject-filter]
 ```
 
@@ -109,7 +108,7 @@ Override flags:
 ### Standard workflow
 
 ```
-1. query --v2 "<question>"     → top-K pages × max-N chunks
+1. query "<question>"          → top-K pages × max-N chunks
 2. Re-chunk hit pages locally  → pull matched chunks' actual text
 3. Synthesize answer from chunks; cite each source page.
 ```
@@ -163,7 +162,7 @@ for i, c in enumerate(containers, 1):
 
 ## Media-aware retrieval (images, PDFs, audio, video)
 
-V2 embedding hits on media kinds directly:
+Embedding hits on media kinds directly:
 - `image` — raw multimodal vector of the image bytes (scene semantics)
 - `image_ocr` — sibling text chunk from Gemini-flash OCR (≥30 non-ws chars)
 - `image_caption` — sibling text chunk from Gemini-flash scene caption (only when OCR was empty)
@@ -205,13 +204,13 @@ asyncio.run(main())
 Usually already done (via background sync). If stale or missing:
 
 ```bash
-# v2 ingest — full pipeline (media → subjects → embeddings)
+# Ingest pipeline (media → subjects → embeddings)
 python3 scripts/onenote_ops.py fetch-media --all           # fetch resources + OCR/caption/transcript
 python3 scripts/classify_subjects.py                       # per-page subject labels
-python3 scripts/build_embeddings.py --v2                   # chunked embeddings (768d)
+python3 scripts/build_embeddings.py                        # chunked embeddings (768d)
 
 # Force full rebuild (after model/format change)
-python3 scripts/build_embeddings.py --v2 --force
+python3 scripts/build_embeddings.py --force
 
 # Media utilities
 python3 scripts/onenote_ops.py fetch-media "<page>"        # one page
@@ -231,7 +230,7 @@ All three ingest steps are incremental — unchanged content is carried forward 
 
 - **Answer concisely.** Lead with the direct answer; supporting detail only if it adds value. Prefer a short paragraph or tight table over bulleted dumps. Skip process narration ("I searched X, then read Y…").
 - **Always cite pages**, using `Title — Notebook / Section [subject-if-non-self-and-non-general]`. Don't dump page IDs.
-- **Semantic search first** (tier 1, `--v2`) for any content question. Tier 2/3 are for when the user names an exact page or keyword.
+- **Semantic search first** (tier 1) for any content question. Tier 2/3 are for when the user names an exact page or keyword.
 - **Decide `--include-general` carefully.** If the query needs reference/protocol/normal-range info to be answerable, pass it. Otherwise default strict.
 - **Long journal/log pages: don't truncate.** Load full content or grep within HTML — specific entries are often deep in multi-month logs.
 - **Never read `onenote_cache.json` directly** — use the CLI.

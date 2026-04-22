@@ -1,6 +1,6 @@
 #!python3
 """Shared Gemini client + retry helpers used across the skill's LLM call sites
-(embeddings v1/v2, media OCR/caption/transcribe, subject classifier).
+(embeddings, media OCR/caption/transcribe, subject classifier).
 
 Kept tiny and import-light so callers that don't touch Gemini (cache-only
 CLI subcommands, search, etc.) are not taxed on startup.

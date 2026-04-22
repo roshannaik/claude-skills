@@ -24,7 +24,7 @@ PAGE_CONTENT_DIR = REFS_DIR / 'page_content'
 PAGE_CONTENT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Subject-classification artifacts (written by classify_subjects.py,
-# read at query time by onenote_embeddings_v2). Defined here to avoid
+# read at query time by onenote_embeddings). Defined here to avoid
 # duplicating the path constants across modules.
 PAGE_SUBJECTS_JSON = REFS_DIR / 'page_subjects.json'
 SUBJECT_OVERRIDES  = REFS_DIR / 'subject_overrides.json'

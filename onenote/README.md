@@ -110,9 +110,7 @@ This prints a device code and a URL. Open the URL in any browser, enter the code
 
 ## Build the semantic-search index
 
-After authenticating and letting the skill cache some pages (any `read-page` or `refresh` call populates the content cache), there are two index paths — **v2 (default, recommended)** and **v1 (legacy)**.
-
-### v2 — chunked + multimodal (recommended)
+After authenticating and letting the skill cache some pages (any `read-page` or `refresh` call populates the content cache), run the three-step ingest:
 
 ```bash
 # 1. Pull media resources + run OCR/caption/transcribe (one-off, per new content)
@@ -122,20 +120,12 @@ python3 scripts/onenote_ops.py fetch-media --all
 python3 scripts/classify_subjects.py
 
 # 3. Build chunked embeddings (gemini-embedding-2-preview, 768d, unified text+media)
-python3 scripts/build_embeddings.py --v2
+python3 scripts/build_embeddings.py
 ```
 
 Step 1 fetches each image/PDF/mp4 referenced in the cached HTML, then runs Gemini 2.5 flash OCR on every image (scene caption for empty-OCR ones) and transcription on audio/video. Step 2 labels each page so subject-aware queries work. Step 3 chunks each page adaptively and embeds text + media bytes into a single vector space.
 
 All three are **incremental** — unchanged pages/resources are skipped. First full build on ~1K pages costs ~$2 on the Gemini paid tier; subsequent runs are pennies. Checkpoints are saved every 50 chunks so a crash mid-build keeps progress.
-
-### v1 — page-level, text-only (legacy)
-
-```bash
-python3 scripts/build_embeddings.py
-```
-
-Kept for backward compatibility. Produces one vector per page with `gemini-embedding-001`. Run only if you explicitly want the legacy path; the v2 store supersedes it.
 
 ---
 
@@ -248,13 +238,10 @@ Or describe what you want in natural language — Claude Code will invoke the sk
 CLI subcommands (for direct use outside Claude Code):
 
 ```bash
-# Semantic search (v2 — chunked + multimodal + subject-aware)
-onenote_ops.py query "<query>" --v2 [--top-k N] [--max-n M] [--notebook NB]
-                                [--subject self,Dad,...] [--include-general]
-                                [--no-subject-filter]
-
-# Semantic search (v1 — legacy page-level)
-onenote_ops.py query "<query>" [--top-k N] [--notebook NB]
+# Semantic search (chunked + multimodal + subject-aware)
+onenote_ops.py query "<query>" [--top-k N] [--max-n M] [--notebook NB]
+                               [--subject self,Dad,...] [--include-general]
+                               [--no-subject-filter]
 
 # Cached / non-semantic operations
 onenote_ops.py search-title "<title keyword>"     # title grep, no API
@@ -264,8 +251,9 @@ onenote_ops.py read-page-html <nb> <sec> <page>
 onenote_ops.py list-notebooks | list-sections <nb> | list-pages <nb> <sec>
 onenote_ops.py refresh <nb>                       # force re-fetch sections + pages
 
-# Media management (v2 ingest)
+# Media management
 onenote_ops.py fetch-media "<page>" [--all] [--pages-file PATH] [--no-derived]
+onenote_ops.py fetch-media --status | --unstick | --max-duration SEC
 onenote_ops.py render-page "<page>"               # write browser-viewable HTML with local image src
 onenote_ops.py gc-media [--dry-run]               # delete orphaned resource bytes
 ```
@@ -287,7 +275,7 @@ Runs at `fetch-media`, `refresh`, `classify_subjects.py`, and `build_embeddings.
 | 5. Transcribe audio/video | media bytes | **Gemini 2.5 flash** | `<rid>.transcript.txt` |
 | 6. Subject classification | page meta + body + OCR | **Gemini 2.5 flash** | `cache/page_subjects.json` (one label per page: `self` / `general` / `<Person>`) |
 | 7. Adaptive chunking | HTML | (local, deterministic) | typed chunks per page |
-| 8. Embedding | text strings + media bytes | **Gemini `gemini-embedding-2-preview`** @ 768d | `cache/embeddings_v2.npz` + `_meta.json` |
+| 8. Embedding | text strings + media bytes | **Gemini `gemini-embedding-2-preview`** @ 768d | `cache/embeddings.npz` + `_meta.json` |
 
 Gemini is chosen for steps 3–6 and 8 for economy: flash runs ingest at ~$0.001/item in batch; Claude via paid API would cost ~10×. Steps 1–2 and 7 involve no LLM.
 
@@ -305,8 +293,8 @@ Typical corpus: ~5× chunks per page; ~6K total chunks for ~1.1K pages.
 
 ### Index structure
 
-- `cache/embeddings_v2.npz` — `{ids: (N,) str, vectors: (N, 768) float32 L2-normalized, kinds: (N,) str}`.
-- `cache/embeddings_v2_meta.json` — `{model, dim, pages: {page_id: {...}}, chunks: {chunk_id: {kind, page_id, heading_path, resource_id, filename, ...}}}`. No embed text stored — retrieved on-demand by re-chunking a hit page (cached per-session).
+- `cache/embeddings.npz` — `{ids: (N,) str, vectors: (N, 768) float32 L2-normalized, kinds: (N,) str}`.
+- `cache/embeddings_meta.json` — `{model, dim, pages: {page_id: {...}}, chunks: {chunk_id: {kind, page_id, heading_path, resource_id, filename, ...}}}`. No embed text stored — retrieved on-demand by re-chunking a hit page (cached per-session).
 - `cache/page_subjects.json` — `{page_id: subject_label}`; subject_overrides.json can patch specific labels.
 
 All are plain files; no external vector DB. Size: ~22 MB for 5,977 vectors.
@@ -371,12 +359,9 @@ The skill caches API responses and derived artifacts locally for speed:
 - `cache/page_subjects.json` — per-page classification: `self` / `general` / `<Person>`; used for subject-aware query filtering
 - `cache/subject_overrides.json` (optional) — manual overrides; takes precedence
 
-**Embedding index (v2, chunked + multimodal, 768d):**
-- `cache/embeddings_v2.npz` — `{ids, vectors, kinds}` — one row per chunk (text / summary / image / image_ocr / image_caption / pdf / audio / video_transcript)
-- `cache/embeddings_v2_meta.json` — per-chunk metadata (page_id, heading_path, resource_id, filename, char_count, source) + per-page `last_modified` for incremental rebuilds
-
-**Legacy v1 embeddings** (page-level, text-only, superseded by v2):
-- `cache/embeddings.npz` + `cache/embeddings_meta.json` — still built by `build_embeddings.py` without `--v2` flag; safe to delete once v2 is in use
+**Embedding index (chunked + multimodal, 768d):**
+- `cache/embeddings.npz` — `{ids, vectors, kinds}` — one row per chunk (text / summary / image / image_ocr / image_caption / pdf / audio / video_transcript)
+- `cache/embeddings_meta.json` — per-chunk metadata (page_id, heading_path, resource_id, filename, char_count, source) + per-page `last_modified` for incremental rebuilds
 
 Sync runtime state (also under `cache/`, gitignored):
 
