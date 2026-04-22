@@ -46,7 +46,7 @@ The skill authenticates via Microsoft's device-code flow — no browser popup, w
 
 ### 4. Google AI Studio API key (for semantic search)
 
-Semantic search embeds pages with Google's `gemini-embedding-001` model. Free tier is generous; no credit card required.
+Semantic search embeds pages with Google's `gemini-embedding-2-preview` model (768-d, unified text+image+PDF+audio vector space). Free tier is generous; no credit card required.
 
 1. Go to [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey) and sign in with a Google account.
 2. Click **Create API key** → copy it (starts with `AIza…`).
@@ -230,7 +230,6 @@ Once installed, invoke in Claude Code:
 /onenote what do my notes say about sleep supplements
 /onenote read Health/Supplements/My Stack
 /onenote list sections in Home Stuff
-/onenote update page X in notebook Y
 ```
 
 Or describe what you want in natural language — Claude Code will invoke the skill automatically.
@@ -242,6 +241,17 @@ CLI subcommands (for direct use outside Claude Code):
 onenote_ops.py query "<query>" [--top-k N] [--max-n M] [--notebook NB]
                                [--subject self,Dad,...] [--include-general]
                                [--no-subject-filter]
+                               [--format text|json] [--with-text] [--explain]
+
+# Similar-page search — no Gemini call; uses the source page's summary vector
+onenote_ops.py query-by-page "<page_id | Notebook / Section / Title>"
+                               [--top-k N] [--max-n M] [--notebook NB]
+                               [--subject self,Dad,...] [--include-general]
+                               [--no-subject-filter]
+                               [--format text|json] [--with-text] [--explain]
+
+# Fetch the full embed_text for matched chunk_ids (re-chunks the host page)
+onenote_ops.py get-chunk <chunk_id> [<chunk_id> ...] [--format text|json]
 
 # Cached / non-semantic operations
 onenote_ops.py search-title "<title keyword>"     # title grep, no API
@@ -256,6 +266,126 @@ onenote_ops.py fetch-media "<page>" [--all] [--pages-file PATH] [--no-derived]
 onenote_ops.py fetch-media --status | --unstick | --max-duration SEC
 onenote_ops.py render-page "<page>"               # write browser-viewable HTML with local image src
 onenote_ops.py gc-media [--dry-run]               # delete orphaned resource bytes
+```
+
+---
+
+## Composing with other reasoning
+
+The CLI is a pure function over a local index — every call is stateless, safe to parallelize, and cheap (~180 ms steady Gemini embed + sub-ms matmul). Patterns that work well when stacking it with other tools or LLM reasoning:
+
+### 1. Structured output for agent loops — `--format json`
+
+The text output is a human-readable table; `--format json` emits a parseable envelope with the same data plus filter metadata. Pipe it through `jq` or parse in Python:
+
+```bash
+# Just the top-hit title per page
+onenote_ops.py query "tradeoffs between two approaches" --top-k 5 --format json \
+  | jq '.pages[] | {title, score: .best_score, chunk: .chunks[0].chunk_id}'
+```
+
+Envelope shape:
+
+```json
+{
+  "mode": "query",
+  "query": "tradeoffs between two approaches",
+  "filters": {"notebook": null, "subject": null, "detected_subjects": ["self"], ...},
+  "top_k": 5, "max_n_per_page": 3, "explain": false, "with_text": false,
+  "pages": [
+    {
+      "page_id": "...",
+      "notebook": "...", "section": "...", "title": "...",
+      "subject": "general",
+      "best_score": 0.71,
+      "chunks": [
+        {"chunk_id": "...#t0007", "kind": "text", "score": 0.71,
+         "snippet": "[text]", "heading_path": [...],
+         "filename": "", "resource_id": ""}
+      ]
+    }
+  ]
+}
+```
+
+### 2. Inline chunk text — `--with-text`
+
+Skip the standard "retrieve → re-chunk the page locally → extract matched chunk text" dance. One call returns the matched text inline (same adaptive chunker, resolved on hit pages only):
+
+```bash
+onenote_ops.py query "arguments for approach X" --top-k 3 --max-n 2 \
+    --with-text --format json \
+  | jq '.pages[].chunks[] | {score, heading_path, text}'
+```
+
+Useful as the *evidence* side of a claim-check loop — the reasoning LLM sees the actual matched passage, not a 200-char snippet.
+
+### 3. Per-kind score breakdown — `--explain`
+
+For each hit page, show how many chunks of each kind passed the filter and what they scored. Answers the "why did this match?" question when a score looks suspicious (e.g., did it hit because of body text, page summary, image OCR, or a raw image vector?):
+
+```
+0.748  Cloud Object Stores  |  Interviews / System Design  [general]
+       0.748  image_ocr         [OCR text in image s3-diagram.png]
+       0.691  text              [text]
+       [explain: total_chunks=22 passing=22 | image_ocr×3(max 0.75), text×14(max 0.69), summary×1(max 0.60), image×4(max 0.58)]
+```
+
+In JSON, this surfaces as `score_by_kind: {<kind>: {count, max, mean}}` + `chunks_total` + `chunks_passing_filter` per hit page. Reasoner can decide to down-weight hits whose best signal came from a low-confidence modality.
+
+### 4. Find similar pages — `query-by-page`
+
+Reuses the source page's own summary vector as the query. No Gemini call. Source page is excluded from results.
+
+```bash
+# From a known page
+onenote_ops.py query-by-page "Home Stuff / Appliances / HVAC Filters" --top-k 5
+
+# Or from a raw page_id pulled out of a prior query's JSON
+onenote_ops.py query-by-page "0-abc...!2581" --top-k 5 --format json
+```
+
+Good for "what else did I write that's adjacent to this?" Same filter flags as `query` apply (notebook, subject, etc.); subject auto-detect is a no-op because there's no query text — pass `--subject` or `--subject all` explicitly if you want filtering.
+
+### 5. Retrieve specific chunks — `get-chunk`
+
+After a query or `query-by-page` call returns chunk IDs, pull only the ones you want — no follow-up query, no re-chunking the full page yourself:
+
+```bash
+onenote_ops.py get-chunk "0-abc...!2581#t0007" "0-def...!1234#media/rid#ocr" \
+                --format json
+```
+
+Returns each chunk's `embed_text` (for text kinds) or a media descriptor (for raw `image`/`pdf`/`audio` chunks with no text), plus page metadata. Missing chunk IDs are returned with `found: false` and a diagnostic `error` — the loop can degrade gracefully.
+
+### 6. Decompose a compound question (parallel fan-out)
+
+Every query is a pure function over the index — safe to run in parallel. Sub-query decomposition is cheap because the expensive step (Gemini embed ~180 ms) fans out instead of stacking:
+
+```bash
+# 3 facets in parallel — ~180 ms wall instead of ~540 ms
+for q in "pros of approach X" "cons of approach X" "examples of approach X"; do
+  onenote_ops.py query "$q" --top-k 3 --format json > "/tmp/$(echo "$q" | tr ' /' '__').json" &
+done
+wait
+jq -s '[.[] | .pages[]] | unique_by(.page_id) | sort_by(-.best_score)' /tmp/*.json
+```
+
+The index isn't mutated by queries (only by ingest), and queries don't hold a lock — concurrent reads are safe from any process.
+
+### 7. Retrieve → refine → re-query
+
+Read the top hit's text, form a sharper query, repeat. Two calls total, not a full RAG loop:
+
+```bash
+# 1. Broad query — grab the best chunk's text
+hit=$(onenote_ops.py query "things I've tried for X" --top-k 1 --max-n 1 \
+        --with-text --format json \
+      | jq -r '.pages[0].chunks[0].text')
+
+# 2. Use terms surfaced in $hit to form a sharper follow-up
+onenote_ops.py query "<sharper query referencing specifics from $hit>" \
+    --top-k 5 --format json
 ```
 
 ---
@@ -284,12 +414,12 @@ Gemini is chosen for steps 3–6 and 8 for economy: flash runs ingest at ~$0.001
 Per-page chunks in document order, then embedded individually:
 
 - **Text chunks**: headings (`h1`/`h2`) as *hard* boundaries only when the section has ≥500 chars; otherwise the heading becomes a soft marker embedded inline. Paragraphs with ≥3 sentences AND ≥150 non-ws chars get their own chunk; shorter ones pack up to 1.5K chars. Over-sized paragraphs are sliding-window split with 200-char overlap.
-- **Table chunks**: small tables (<1.5K chars) emit one chunk; larger tables produce row-group chunks with the column header re-prefixed. Row-group size adapts to average row body (5–10 rows typical). Cells >1K chars trigger intra-cell windowing with row-context re-prefix.
+- **Table chunks**: small tables (≤1.5K chars) emit one chunk. Larger tables are **row-atomic** — one chunk per row, with the column header re-prefixed so each row stands alone. Nested tables inside a cell are serialized inline so they travel with the parent row. A single pathologically fat row (>2K chars) is sliding-window split, with the row's first-cell label (typically a date or key) prefixed to every window so the anchor rides along.
 - **Media chunks** (per resource): one raw-bytes chunk (image/PDF/audio → multimodal embedding) + sibling text chunks when OCR or caption exists.
 - **Page-summary chunk**: one per page (`kind=summary`) — whole body capped at 5K chars.
 - **Routing header** (prepended to every text chunk): `Notebook / Section / Page / Heading path`. Provides retrieval context beyond the chunk body.
 
-Typical corpus: ~5× chunks per page; ~6K total chunks for ~1.1K pages.
+Typical fan-out: a dozen-ish chunks per page for a normal text page, 50+ for a big journal / tabular log with images. Chunks per page scale with density, table length, and media count.
 
 ### Index structure
 
@@ -297,7 +427,7 @@ Typical corpus: ~5× chunks per page; ~6K total chunks for ~1.1K pages.
 - `cache/embeddings_meta.json` — `{model, dim, pages: {page_id: {...}}, chunks: {chunk_id: {kind, page_id, heading_path, resource_id, filename, ...}}}`. No embed text stored — retrieved on-demand by re-chunking a hit page (cached per-session).
 - `cache/page_subjects.json` — `{page_id: subject_label}`; subject_overrides.json can patch specific labels.
 
-All are plain files; no external vector DB. Size: ~22 MB for 5,977 vectors.
+All are plain files; no external vector DB. Each 768-d float32 vector is ~3 KB; an npz with a few thousand vectors fits in a few MB.
 
 ### Query pipeline
 
@@ -320,13 +450,15 @@ All are plain files; no external vector DB. Size: ~22 MB for 5,977 vectors.
 
 - **Subject-aware filtering** is default-on and *strict* (person-only). `--include-general` adds general reference pages alongside; used when the query needs reference material to be answerable (how X works, precautions before X, normal ranges, interpretation). The orchestrating Claude harness decides when to pass the flag based on the query; no Gemini call for this decision.
 - **Top-K × max-N** (default 10 × 3): surface up to N matching chunks per page, across K distinct pages. Shows multiple relevant chunks per page when they exist, without one page dominating results.
-- **No re-rank**, no ANN index — exact cosine matmul over ~6K vectors takes ~1 ms.
+- **No re-rank**, no ANN index — exact cosine matmul over the whole chunk corpus is sub-millisecond at this scale (a few thousand vectors × 768 dims).
 
 Typical query latency: **~280 ms** steady state (embed call dominates). Local compute is sub-millisecond.
 
+`query-by-page` reuses an already-stored summary vector as the query, skipping the Gemini embed call entirely — sub-50 ms end-to-end. `get-chunk` does no embed and no matmul; it only re-chunks the host page to recover `embed_text`, and returns a descriptor for raw media chunks.
+
 ### Synthesis (when invoked via Claude Code)
 
-Retrieval returns chunk IDs; the orchestrating Claude re-chunks each hit page at query time to pull the matched chunks' exact text (`embed_text`), feeds them as context to itself, and writes the answer with page-level citations. Claude is free via the subscription, instant, and avoids the latency and 503-flakiness of calling Gemini flash as a generator.
+Retrieval returns chunk IDs; the orchestrating Claude re-chunks each hit page at query time to pull the matched chunks' exact text (`embed_text`), feeds them as context to itself, and writes the answer with page-level citations. `query --with-text` or `get-chunk <chunk_id>` short-circuit this — the re-chunk happens inside the CLI and the text comes back inline, which is cheaper when only a subset of pages is needed. Claude is free via the subscription, instant, and avoids the latency and 503-flakiness of calling Gemini flash as a generator.
 
 ### Where LLMs are used — summary
 

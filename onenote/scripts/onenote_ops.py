@@ -38,7 +38,9 @@ from onenote_api import (  # noqa: F401
     get_notebooks, get_sections, get_pages, refresh_notebook,
     find_page, find_pages_batch, refresh_all_notebooks,
 )
-from onenote_embeddings import semantic_search  # noqa: F401
+from onenote_embeddings import (  # noqa: F401
+    semantic_search, query_by_page, get_chunk_text,
+)
 from onenote_media import (  # noqa: F401
     parse_resources, fetch_resource, download_resources_for_page,
     load_resource, is_cached, PAGE_RESOURCES_DIR,
@@ -85,6 +87,102 @@ def _resolve_identifier(ident: str):
 def _read_pages_file(path: str) -> list:
     lines = Path(path).read_text().splitlines()
     return [ln for ln in (l.strip() for l in lines) if ln and not ln.startswith('#')]
+
+
+def _emit_search_results(pages, args, *, mode: str,
+                          query_text=None, subject_list=None,
+                          source_page=None) -> None:
+    """Render query / query-by-page results as text or JSON."""
+    if args.format == 'json':
+        import json
+        detected = pages[0].get('_detected_subjects') if pages else None
+        ig_used  = pages[0].get('_include_general')   if pages else None
+        envelope = {
+            'mode':    mode,
+            'query':   query_text,
+            'filters': {
+                'notebook':          args.notebook,
+                'subject':           subject_list,
+                'no_subject_filter': args.no_subject_filter,
+                'include_general':   args.include_general,
+                'detected_subjects': detected,
+                'include_general_effective': ig_used,
+            },
+            'top_k':          args.top_k,
+            'max_n_per_page': args.max_n,
+            'explain':        args.explain,
+            'with_text':      args.with_text,
+            'pages':          [_json_page(p) for p in pages],
+        }
+        if source_page is not None:
+            envelope['source_page'] = source_page
+        print(json.dumps(envelope, indent=2, ensure_ascii=False))
+        return
+
+    # Text output
+    if not pages:
+        print('No results.')
+        return
+    detected = pages[0].get('_detected_subjects')
+    ig_used  = pages[0].get('_include_general')
+    if detected:
+        general_note = ' + general' if ig_used else ''
+        print(f"[filter: subject ∈ {{{', '.join(detected)}}}{general_note}]")
+    if source_page is not None:
+        print(f"[query-by-page: {source_page['title']}  |  "
+              f"{source_page['notebook']} / {source_page['section']}]")
+    for p in pages:
+        best = p['chunks'][0]['score']
+        subj_note = f"  [{p.get('subject','')}]" if p.get('subject') else ''
+        print(f"{best:.3f}  {p['title']}  |  {p['notebook']} / {p['section']}{subj_note}")
+        for c in p['chunks']:
+            hp = ' > '.join(c.get('heading_path', []) or [])
+            hp_note = f'  ({hp})' if hp else ''
+            print(f"       {c['score']:.3f}  {c['kind']:17s} {c['snippet']}{hp_note}")
+            if args.with_text and c.get('text'):
+                # Indent each line so it's visually nested under the chunk.
+                for line in c['text'].splitlines():
+                    print(f"           {line}")
+        if args.explain and p.get('score_by_kind'):
+            pieces = [f"{k}×{v['count']}(max {v['max']:.2f})"
+                      for k, v in sorted(p['score_by_kind'].items(),
+                                         key=lambda kv: -kv[1]['max'])]
+            print(f"       [explain: total_chunks={p.get('chunks_total')} "
+                  f"passing={p.get('chunks_passing_filter')} | "
+                  + ', '.join(pieces) + ']')
+
+
+def _json_page(p: dict) -> dict:
+    """Project a result page into a JSON-friendly shape (drops private keys)."""
+    out = {
+        'page_id':    p.get('page_id'),
+        'notebook':   p.get('notebook'),
+        'section':    p.get('section'),
+        'title':      p.get('title'),
+        'subject':    p.get('subject'),
+        'best_score': round(p['chunks'][0]['score'], 4) if p.get('chunks') else None,
+        'chunks':     [_json_chunk(c) for c in p.get('chunks', [])],
+    }
+    if 'score_by_kind' in p:
+        out['score_by_kind']         = p['score_by_kind']
+        out['chunks_total']          = p.get('chunks_total')
+        out['chunks_passing_filter'] = p.get('chunks_passing_filter')
+    return out
+
+
+def _json_chunk(c: dict) -> dict:
+    out = {
+        'chunk_id':     c.get('chunk_id'),
+        'kind':         c.get('kind'),
+        'score':        round(c['score'], 4),
+        'snippet':      c.get('snippet'),
+        'heading_path': c.get('heading_path', []),
+        'filename':     c.get('filename', ''),
+        'resource_id':  c.get('resource_id', ''),
+    }
+    if 'text' in c:
+        out['text'] = c['text']
+    return out
 
 
 async def _fetch_media_one(client, row, *, skip_derived: bool = False) -> dict:
@@ -200,23 +298,68 @@ async def main_async(args):
                                 notebook=args.notebook,
                                 subject=subj_list,
                                 no_subject_filter=args.no_subject_filter,
-                                include_general=args.include_general)
-        if not pages:
-            print('No results.')
+                                include_general=args.include_general,
+                                explain=args.explain,
+                                include_chunk_text=args.with_text)
+        _emit_search_results(pages, args, mode='query',
+                              query_text=args.query,
+                              subject_list=subj_list)
+        return
+
+    if args.cmd == 'query-by-page':
+        row = _resolve_identifier(args.page)
+        if row is None:
+            print(f'Error: unresolved page identifier: {args.page}', file=sys.stderr)
+            sys.exit(1)
+        page_id = row[3]
+        subj_list = None
+        if args.subject:
+            subj_list = [s.strip() for s in args.subject.split(',') if s.strip()]
+        try:
+            pages = query_by_page(page_id,
+                                  top_k_pages=args.top_k,
+                                  max_n_per_page=args.max_n,
+                                  notebook=args.notebook,
+                                  subject=subj_list,
+                                  no_subject_filter=args.no_subject_filter,
+                                  include_general=args.include_general,
+                                  explain=args.explain,
+                                  include_chunk_text=args.with_text)
+        except ValueError as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+        _emit_search_results(pages, args, mode='query_by_page',
+                              query_text=None,
+                              subject_list=subj_list,
+                              source_page={'page_id': page_id,
+                                           'notebook': row[0],
+                                           'section':  row[1],
+                                           'title':    row[2]})
+        return
+
+    if args.cmd == 'get-chunk':
+        results = [get_chunk_text(cid) for cid in args.chunk_ids]
+        if args.format == 'json':
+            import json
+            print(json.dumps({'chunks': results}, indent=2, ensure_ascii=False))
             return
-        detected = pages[0].get('_detected_subjects') if pages else None
-        ig_used = pages[0].get('_include_general') if pages else None
-        if detected:
-            general_note = ' + general' if ig_used else ''
-            print(f"[filter: subject ∈ {{{', '.join(detected)}}}{general_note}]")
-        for p in pages:
-            best = p['chunks'][0]['score']
-            subj_note = f"  [{p.get('subject','')}]" if p.get('subject') else ''
-            print(f"{best:.3f}  {p['title']}  |  {p['notebook']} / {p['section']}{subj_note}")
-            for c in p['chunks']:
-                hp = ' > '.join(c.get('heading_path', []) or [])
-                hp_note = f'  ({hp})' if hp else ''
-                print(f"       {c['score']:.3f}  {c['kind']:17s} {c['snippet']}{hp_note}")
+        for r in results:
+            header = f"=== {r['chunk_id']}"
+            if r.get('kind'):
+                header += f"  [{r['kind']}]"
+            where = f"{r.get('notebook','')} / {r.get('section','')} / {r.get('title','')}"
+            if where.strip(' /'):
+                header += f"  ({where})"
+            header += ' ==='
+            print(header)
+            if r.get('error'):
+                print(f'  ! {r["error"]}')
+            if r.get('text'):
+                print(r['text'])
+            elif not r.get('error'):
+                print(f'  [no text — media chunk]'
+                      + (f' filename={r["filename"]}' if r.get('filename') else ''))
+            print()
         return
 
     # Commands that never need a Graph client: find_page lazy-creates one only
@@ -225,8 +368,8 @@ async def main_async(args):
     # client to avoid triggering auth when the user just wants to check/clear
     # a stuck lock.
     skip_client = (args.cmd in ('read-page', 'read-page-html', 'gc-media',
-                                 'render-page', 'query', 'search-title',
-                                 'search-content')
+                                 'render-page', 'query', 'query-by-page',
+                                 'get-chunk', 'search-title', 'search-content')
                    or (args.cmd == 'fetch-media'
                        and (getattr(args, 'status', False)
                             or getattr(args, 'unstick', False))))
@@ -438,24 +581,50 @@ if __name__ == '__main__':
     p.add_argument('--dry-run', action='store_true',
                    help='Report what would be deleted without deleting')
 
+    def _add_search_flags(sp):
+        sp.add_argument('--top-k', type=int, default=10, dest='top_k',
+                        help='Number of pages to return (default 10)')
+        sp.add_argument('--max-n', type=int, default=3, dest='max_n',
+                        help='Max chunks per page in results (default 3)')
+        sp.add_argument('--notebook', metavar='NOTEBOOK',
+                        help='Restrict search to a single notebook (case-insensitive)')
+        sp.add_argument('--subject', metavar='LIST',
+                        help='Comma-separated subject labels (self, Dad, Mom, ...) '
+                             'to restrict results. Overrides auto-detection. Use "all" '
+                             'to disable filtering.')
+        sp.add_argument('--no-subject-filter', action='store_true',
+                        help='Disable automatic subject-aware filtering')
+        sp.add_argument('--include-general', action='store_true',
+                        help='Also include general reference pages alongside '
+                             'person-specific ones. Default is strict (person-only).')
+        sp.add_argument('--format', choices=['text', 'json'], default='text',
+                        help='Output format (default text). "json" emits a parseable '
+                             'envelope with filters + per-chunk metadata.')
+        sp.add_argument('--with-text', action='store_true', dest='with_text',
+                        help='Inline each matched chunk\'s full embed_text. '
+                             'Re-chunks hit pages on demand.')
+        sp.add_argument('--explain', action='store_true',
+                        help='For each hit page, emit per-kind score breakdown '
+                             '(count, max, mean) across ALL its chunks that passed filters.')
+
     p = sub.add_parser('query',
                        help='Chunked multimodal semantic search over all cached pages')
     p.add_argument('query', help='Natural language query')
-    p.add_argument('--top-k', type=int, default=10, dest='top_k',
-                   help='Number of pages to return (default 10)')
-    p.add_argument('--max-n', type=int, default=3, dest='max_n',
-                   help='Max chunks per page in results (default 3)')
-    p.add_argument('--notebook', metavar='NOTEBOOK',
-                   help='Restrict search to a single notebook (case-insensitive)')
-    p.add_argument('--subject', metavar='LIST',
-                   help='Comma-separated subject labels (self, Dad, Mom, ...) '
-                        'to restrict results. Overrides auto-detection. Use "all" '
-                        'to disable filtering.')
-    p.add_argument('--no-subject-filter', action='store_true',
-                   help='Disable automatic subject-aware filtering')
-    p.add_argument('--include-general', action='store_true',
-                   help='Also include general reference pages alongside '
-                        'person-specific ones. Default is strict (person-only).')
+    _add_search_flags(p)
+
+    p = sub.add_parser('query-by-page',
+                       help='Nearest-neighbor search using a page\'s summary vector '
+                            'as the query (no Gemini call; self-page excluded).')
+    p.add_argument('page', help='page_id OR "Notebook / Section / Title"')
+    _add_search_flags(p)
+
+    p = sub.add_parser('get-chunk',
+                       help='Recover the full embed_text for one or more chunk_ids '
+                            '(re-chunks the host page on demand).')
+    p.add_argument('chunk_ids', nargs='+', metavar='CHUNK_ID',
+                   help='Chunk IDs (format: <page_id>#<suffix>)')
+    p.add_argument('--format', choices=['text', 'json'], default='text',
+                   help='Output format (default text).')
 
     args = parser.parse_args()
 

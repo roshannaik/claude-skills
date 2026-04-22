@@ -451,45 +451,59 @@ def _detect_subjects_in_query(query: str, known: set) -> set:
 
 
 
-def semantic_search(query: str, top_k_pages: int = 10,
-                    max_n_per_page: int = 3, notebook: str = None,
-                    subject: list = None, no_subject_filter: bool = False,
-                    include_general: bool = False) -> list:
-    """Top-K-pages with max-N per page. Returns list of per-page hit lists.
-
-    Subject-aware filtering:
-      - If no_subject_filter=True, no subject filtering.
-      - Else if `subject` is an explicit list (e.g. ['self','Dad']), filter to it.
-      - Else auto-detect subjects from the query text; if any are detected,
-        restrict results to those subjects.
-      - Default is STRICT (person only). Pass include_general=True to also
-        admit subject='general' pages alongside the detected subjects.
-
-    The caller decides whether to include general info — the script does not
-    call any LLM for this decision.
-
-    Each returned element:
-        {'page_id', 'notebook', 'section', 'title', 'subject',
-         'chunks': [...], ...}
-    """
+def _embed_query_vector(query: str):
+    """Embed a text query → L2-normalized float32 vector."""
     import numpy as np
-
-    state = _load_for_query()
-    ids, kinds, vectors, meta = (state['ids'], state['kinds'],
-                                  state['vectors'], state['meta'])
-    subjects_map = state.get('subjects', {})
-    if not ids:
-        return []
-
     client = _get_client()
     q_vec = _embed_with_retry(client, [query], 'RETRIEVAL_QUERY')[0]
     q = np.asarray(q_vec, dtype=np.float32)
     n = np.linalg.norm(q)
     if n > 0:
         q /= n
+    return q
 
-    # vectors are already NaN-sanitized at load (see _load_for_query)
-    scores = vectors @ q
+
+def _resolve_allowed_subjects(query: str, subject: list, no_subject_filter: bool,
+                               subjects_map: dict):
+    """Return (allowed_subjects, detected_subjects). allowed_subjects is None
+    when no filter applies; otherwise a set of labels. detected_subjects is the
+    set auto-inferred from the query (empty if subject was explicit or filter disabled).
+    """
+    if no_subject_filter:
+        return None, set()
+    if subject:
+        if 'all' in {s.lower() for s in subject}:
+            return None, set()
+        norm = {(USER_SELF_LABEL if s.lower() in ('self','me','i','roshan') else s)
+                for s in subject}
+        return norm, set()
+    known = _known_subjects(subjects_map)
+    detected = _detect_subjects_in_query(query or '', known)
+    if detected:
+        return set(detected), detected
+    return None, set()
+
+
+def _search_with_query_vector(q_vec, *, top_k_pages: int = 10,
+                               max_n_per_page: int = 3, notebook: str = None,
+                               allowed_subjects: set = None,
+                               include_general: bool = False,
+                               detected_subjects: set = None,
+                               exclude_page_ids: set = None,
+                               explain: bool = False,
+                               include_chunk_text: bool = False) -> list:
+    """Core search: apply filters against a precomputed query vector, return
+    top-K pages × max-N chunks. See `semantic_search` / `query_by_page` for
+    param semantics."""
+    import numpy as np
+
+    state = _load_for_query()
+    ids, vectors, meta = state['ids'], state['vectors'], state['meta']
+    subjects_map = state.get('subjects', {})
+    if not ids:
+        return []
+
+    scores = vectors @ q_vec  # vectors NaN-sanitized at load
 
     chunks_meta = meta.get('chunks', {})
     pages_meta  = meta.get('pages', {})
@@ -502,28 +516,6 @@ def semantic_search(query: str, top_k_pages: int = 10,
             if pm.get('notebook', '').lower() != nb_lower:
                 scores[idx] = -1.0
 
-    # ---- Subject filter ----
-    # Resolve the allowed subject set:
-    #   - Explicit --subject list → use it (with 'self'/'me' mapped to USER_SELF_LABEL).
-    #   - no_subject_filter → no filter.
-    #   - Otherwise auto-detect from query.
-    allowed_subjects = None
-    detected = set()
-    if no_subject_filter:
-        allowed_subjects = None
-    elif subject:
-        norm = {(USER_SELF_LABEL if s.lower() in ('self','me','i','roshan') else s)
-                for s in subject}
-        if 'all' in {s.lower() for s in subject}:
-            allowed_subjects = None
-        else:
-            allowed_subjects = norm
-    else:
-        known = _known_subjects(subjects_map)
-        detected = _detect_subjects_in_query(query, known)
-        if detected:
-            allowed_subjects = set(detected)
-
     if allowed_subjects is not None:
         effective_allowed = set(allowed_subjects)
         if include_general:
@@ -532,6 +524,12 @@ def semantic_search(query: str, top_k_pages: int = 10,
             pid = chunks_meta.get(cid, {}).get('page_id', '')
             subj = subjects_map.get(pid, 'general')
             if subj not in effective_allowed:
+                scores[idx] = -1.0
+
+    if exclude_page_ids:
+        for idx, cid in enumerate(ids):
+            pid = chunks_meta.get(cid, {}).get('page_id', '')
+            if pid in exclude_page_ids:
                 scores[idx] = -1.0
 
     # Walk descending scores, dedupe by page w/ max-N. Use argpartition to
@@ -584,11 +582,191 @@ def semantic_search(query: str, top_k_pages: int = 10,
         if len(results) >= top_k_pages:
             break
 
-    if results and detected:
-        results[0]['_detected_subjects'] = sorted(detected)
+    if explain and results:
+        # Per-hit-page: walk ALL its chunks, break down post-filter scores by kind.
+        page_to_indices = {}
+        for idx, cid in enumerate(ids):
+            pid = chunks_meta.get(cid, {}).get('page_id', '')
+            page_to_indices.setdefault(pid, []).append(idx)
+        for r in results:
+            pid = r['page_id']
+            all_idx = page_to_indices.get(pid, [])
+            by_kind = {}
+            passing = 0
+            for idx in all_idx:
+                s = float(scores[idx])
+                if s <= -0.5:
+                    continue
+                passing += 1
+                cid = ids[idx]
+                kind = chunks_meta.get(cid, {}).get('kind', '')
+                by_kind.setdefault(kind, []).append(s)
+            r['score_by_kind'] = {
+                k: {'count': len(v), 'max': round(max(v), 4),
+                    'mean': round(sum(v) / len(v), 4)}
+                for k, v in by_kind.items()
+            }
+            r['chunks_total'] = len(all_idx)
+            r['chunks_passing_filter'] = passing
+
+    if include_chunk_text and results:
+        text_map = _build_chunk_text_map({r['page_id'] for r in results})
+        for r in results:
+            for ch in r['chunks']:
+                ch['text'] = text_map.get(ch['chunk_id'])
+
+    if results and detected_subjects:
+        results[0]['_detected_subjects'] = sorted(detected_subjects)
     if results and allowed_subjects is not None:
         results[0]['_include_general'] = bool(include_general)
     return results
+
+
+def semantic_search(query: str, top_k_pages: int = 10,
+                    max_n_per_page: int = 3, notebook: str = None,
+                    subject: list = None, no_subject_filter: bool = False,
+                    include_general: bool = False,
+                    explain: bool = False,
+                    include_chunk_text: bool = False) -> list:
+    """Top-K-pages with max-N per page. Returns list of per-page hit lists.
+
+    Subject-aware filtering:
+      - If no_subject_filter=True, no subject filtering.
+      - Else if `subject` is an explicit list (e.g. ['self','Dad']), filter to it.
+      - Else auto-detect subjects from the query text; if any are detected,
+        restrict results to those subjects.
+      - Default is STRICT (person only). Pass include_general=True to also
+        admit subject='general' pages alongside the detected subjects.
+
+    explain=True → each result page gets `score_by_kind`, `chunks_total`,
+    `chunks_passing_filter`.
+
+    include_chunk_text=True → each chunk gets a `text` field with its embed_text
+    (re-chunks hit pages; media chunks with no text get None).
+
+    Each returned element:
+        {'page_id', 'notebook', 'section', 'title', 'subject',
+         'chunks': [...], ...}
+    """
+    state = _load_for_query()
+    if not state['ids']:
+        return []
+    subjects_map = state.get('subjects', {})
+
+    allowed, detected = _resolve_allowed_subjects(
+        query, subject, no_subject_filter, subjects_map)
+    q_vec = _embed_query_vector(query)
+    return _search_with_query_vector(
+        q_vec,
+        top_k_pages=top_k_pages, max_n_per_page=max_n_per_page,
+        notebook=notebook, allowed_subjects=allowed,
+        include_general=include_general, detected_subjects=detected,
+        explain=explain, include_chunk_text=include_chunk_text,
+    )
+
+
+def query_by_page(page_id: str, top_k_pages: int = 10,
+                  max_n_per_page: int = 3, notebook: str = None,
+                  subject: list = None, no_subject_filter: bool = False,
+                  include_general: bool = False,
+                  explain: bool = False,
+                  include_chunk_text: bool = False) -> list:
+    """Find pages similar to `page_id`, using that page's summary vector as the query.
+
+    The source page is excluded from results. Other filters behave identically
+    to `semantic_search` — but since there's no query text, subject auto-detect
+    is a no-op (pass `subject` explicitly to restrict).
+    """
+    state = _load_for_query()
+    ids, vectors = state['ids'], state['vectors']
+    if not ids:
+        return []
+
+    summary_id = f'{page_id}#summary'
+    try:
+        idx = ids.index(summary_id)
+    except ValueError:
+        raise ValueError(
+            f'No summary vector found for page_id {page_id!r}. '
+            f'The page may not be indexed, or its page_id is misspelled.')
+    q_vec = vectors[idx]  # already normalized
+
+    subjects_map = state.get('subjects', {})
+    allowed, detected = _resolve_allowed_subjects(
+        '', subject, no_subject_filter, subjects_map)
+    return _search_with_query_vector(
+        q_vec,
+        top_k_pages=top_k_pages, max_n_per_page=max_n_per_page,
+        notebook=notebook, allowed_subjects=allowed,
+        include_general=include_general, detected_subjects=detected,
+        exclude_page_ids={page_id},
+        explain=explain, include_chunk_text=include_chunk_text,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunk-text recovery (re-chunks host page on demand)
+# ---------------------------------------------------------------------------
+
+def _build_chunk_text_map(page_ids) -> dict:
+    """Re-chunk each page_id and return {chunk_id: embed_text} for text chunks.
+    Media chunks (image/pdf/audio raw) have no embed_text and are omitted."""
+    from onenote_chunks import chunk_page
+    out = {}
+    pbid = pages_by_id()
+    for pid in page_ids:
+        row = pbid.get(pid)
+        if not row:
+            continue
+        nb, sec, p = row
+        lm = p.get('last_modified', '')
+        html = load_content_cache(pid, lm)
+        if html is None:
+            continue
+        pmeta = {'notebook': nb, 'section': sec, 'title': p['title']}
+        for c in chunk_page(pid, html, pmeta):
+            if c.embed_text:
+                out[c.chunk_id] = c.embed_text
+    return out
+
+
+def get_chunk_text(chunk_id: str) -> dict:
+    """Recover a chunk's embed_text + descriptor by re-chunking its host page.
+
+    Returns:
+        {'chunk_id', 'found': bool, 'page_id', 'kind', 'filename', 'resource_id',
+         'heading_path', 'notebook', 'section', 'title', 'text': str|None,
+         'error': str|None}
+    """
+    meta = _load_meta()
+    cm = meta.get('chunks', {}).get(chunk_id, {})
+    page_id = cm.get('page_id') or chunk_id.split('#', 1)[0]
+
+    pm = meta.get('pages', {}).get(page_id, {})
+    out = {
+        'chunk_id': chunk_id,
+        'found': bool(cm),
+        'page_id': page_id,
+        'kind': cm.get('kind', ''),
+        'filename': cm.get('filename', ''),
+        'resource_id': cm.get('resource_id', ''),
+        'heading_path': cm.get('heading_path', []),
+        'notebook': pm.get('notebook', ''),
+        'section':  pm.get('section', ''),
+        'title':    pm.get('title', ''),
+        'text': None,
+        'error': None,
+    }
+    if not cm:
+        out['error'] = 'chunk_id not found in embeddings meta'
+        return out
+
+    text_map = _build_chunk_text_map([page_id])
+    out['text'] = text_map.get(chunk_id)
+    if out['text'] is None and out['kind'] not in ('image', 'pdf', 'audio'):
+        out['error'] = ('chunk re-chunk miss — page HTML or cached state may '
+                        'have changed since index was built')
+    return out
 
 
 def _chunk_snippet(chunk_meta: dict) -> str:
