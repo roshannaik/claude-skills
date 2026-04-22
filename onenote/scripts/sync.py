@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from onenote_cache import (
     REFS_DIR, _content_path, _load_cache, atomic_write,
 )
+from onenote_lock import duration_limit, DurationExceeded as SyncTimeout
 
 LOCK_FILE      = REFS_DIR / '.sync.lock'
 HEARTBEAT_FILE = REFS_DIR / '.sync.heartbeat'
@@ -51,14 +52,6 @@ LOG_FILE       = REFS_DIR / 'sync.log'
 
 HEARTBEAT_INTERVAL  = 5.0
 DEFAULT_MAX_SECONDS = 600
-
-
-class SyncTimeout(Exception):
-    """Raised by the SIGALRM handler when --max-duration is exceeded."""
-
-
-def _alarm_handler(signum, frame):
-    raise SyncTimeout(f'exceeded max-duration')
 
 
 def _append_log(row: dict) -> None:
@@ -250,18 +243,13 @@ def cmd_sync(args) -> int:
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb_thread.start()
 
-    # Deterministic self-kill: if the sync exceeds max_duration, SIGALRM fires
-    # and SyncTimeout propagates out of asyncio.run like any other exception.
-    if args.max_duration > 0:
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(args.max_duration)
-
     t0 = time.perf_counter()
     state: dict = {'status': 'ok', 'started_at': started_at}
     result: dict | None = None
 
     try:
-        result = asyncio.run(_sync_async(force_embed=args.force_embed))
+        with duration_limit(args.max_duration, 'sync'):
+            result = asyncio.run(_sync_async(force_embed=args.force_embed))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'elapsed_sec': round(time.perf_counter() - t0, 1),
@@ -285,14 +273,12 @@ def cmd_sync(args) -> int:
         }
         atomic_write(STATE_FILE, json.dumps(state, indent=2))
         _append_log(state)
-        signal.alarm(0)
         _stop_heartbeat.set()
         _clear_heartbeat()
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
         raise
 
-    signal.alarm(0)
     atomic_write(STATE_FILE, json.dumps(state, indent=2))
 
     # One-line JSONL row — flat keys for easy grep/jq.

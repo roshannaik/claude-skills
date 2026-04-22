@@ -21,6 +21,7 @@ import os
 import signal
 import socket
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,41 @@ from onenote_cache import REFS_DIR
 
 class LockHeldError(RuntimeError):
     """Raised when the named lock is held by another process."""
+
+
+class DurationExceeded(Exception):
+    """Raised by a SIGALRM handler when a `duration_limit` block exceeds
+    its max wall-clock time. Propagates through asyncio.run, subprocess
+    waits, network I/O, etc. — the signal fires regardless of what the
+    process is blocked on."""
+
+
+def _alarm_handler(signum, frame):
+    raise DurationExceeded('exceeded max-duration')
+
+
+@contextmanager
+def duration_limit(seconds: int, label: str = 'operation'):
+    """Scope-based SIGALRM timeout. `seconds<=0` disables the alarm.
+
+    Usage:
+        with duration_limit(600, 'fetch-media'):
+            asyncio.run(long_running_work())
+
+    On timeout, raises DurationExceeded. Not reentrant — nested calls
+    would step on each other's SIGALRM handler. Restoring the previous
+    handler in `finally` is best-effort.
+    """
+    if seconds <= 0:
+        yield
+        return
+    prev = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev)
 
 
 def _lock_path(name: str) -> Path:

@@ -280,6 +280,7 @@ async def main_async(args):
     elif args.cmd == 'fetch-media':
         from onenote_lock import (
             ProcessLock, LockHeldError, unstick, read_lock_body, is_locked,
+            duration_limit, DurationExceeded,
         )
 
         # Diagnostic / recovery modes — don't hold the lock, don't fetch.
@@ -323,17 +324,17 @@ async def main_async(args):
             if not rows:
                 return
 
-        try:
-            with ProcessLock('fetch_media'):
-                summaries = []
-                for row in rows:
-                    summary = await _fetch_media_one(client, row,
-                                                      skip_derived=args.no_derived)
-                    summaries.append(summary)
-                _print_media_summary(summaries)
-        except LockHeldError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(2)
+        # LockHeldError and DurationExceeded aren't caught here: the alarm
+        # handler raises through asyncio's selector loop before the coroutine
+        # can react, so the catch has to be outside asyncio.run (see __main__).
+        with ProcessLock('fetch_media'), \
+             duration_limit(args.max_duration, 'fetch-media'):
+            summaries = []
+            for row in rows:
+                summary = await _fetch_media_one(client, row,
+                                                  skip_derived=args.no_derived)
+                summaries.append(summary)
+            _print_media_summary(summaries)
 
     elif args.cmd == 'render-page':
         rows = []
@@ -432,6 +433,9 @@ if __name__ == '__main__':
     p.add_argument('--unstick', action='store_true',
                    help='SIGTERM (then SIGKILL after 5s) a hung fetch-media '
                         'owner process to release the lock, then exit.')
+    p.add_argument('--max-duration', type=int, default=1800, dest='max_duration',
+                   help='Self-kill the run via SIGALRM if it exceeds N seconds '
+                        '(default 1800 = 30 min). 0 disables.')
 
     p = sub.add_parser('render-page',
                        help='Write browser-viewable HTML with images rewritten to local file:// URIs')
@@ -471,4 +475,15 @@ if __name__ == '__main__':
     if not args.cmd:
         parser.print_help()
     else:
-        asyncio.run(main_async(args))
+        try:
+            asyncio.run(main_async(args))
+        except Exception as e:
+            # Import lazily so non-fetch-media paths don't pay import cost.
+            from onenote_lock import LockHeldError, DurationExceeded
+            if isinstance(e, LockHeldError):
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
+            if isinstance(e, DurationExceeded):
+                print(f"TIMED OUT: {e}", file=sys.stderr)
+                sys.exit(3)
+            raise
