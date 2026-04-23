@@ -1,7 +1,7 @@
 ---
 name: onenote
-description: Read OneNote notebooks via Microsoft Graph API. Use when asked to search or read content in any OneNote notebook (Health, Home Stuff, AI, Economy, HiFi, Hinduism, Spiritual Life, Family and Culture, All Hands, Interviews, etc.). Chunked multimodal semantic search over all pages + embedded images/PDFs/audio/video via Gemini embeddings.
-argument-hint: 'query "my panchakarma oils", read Health/Supplements, list sections in Home Stuff'
+description: Read and search OneNote notebooks. Use when asked to find information in my OneNote notes, answer questions from them, or read or list sections and pages.
+argument-hint: 'query "my latest lab tests", read Health/Supplements, list sections in Home Stuff'
 allowed-tools: Bash, Read
 author: Roshan Naik
 metadata:
@@ -34,9 +34,9 @@ metadata:
 
 All paths below are written as `$SKILL_ROOT/onenote/...`. `$SKILL_ROOT` is the harness's skills directory:
 - **Claude Code**: `~/.claude/skills`
-- **openclaw**:    `~/.openclaw/workspace/skills`
+- **OpenClaw**:    `~/.openclaw/workspace/skills`
 
-When constructing shell commands, expand `$SKILL_ROOT` to the actual path for your harness.
+When constructing shell commands, expand `$SKILL_ROOT` to the actual path for your harness. $SKILL_ROOT/onenote will be typically a symlink to shared directory.
 
 ## Setup
 
@@ -52,7 +52,8 @@ When constructing shell commands, expand `$SKILL_ROOT` to the actual path for yo
   - `page_subjects.json` — per-page subject label (`self` / `general` / `<Person>`)
   - `embeddings.npz` + `embeddings_meta.json` — chunked multimodal index (768d)
 
-Requires `GEMINI_API_KEY` for semantic search. Uses `gemini-embedding-2-preview` @ 768d with a unified text+image+PDF+audio vector space.
+Requires `MS_CLIENT_ID' in env for accessing MS Graph API.
+Requires `GEMINI_API_KEY` in env for semantic search. Uses `gemini-embedding-2-preview` @ 768d with a unified text+image+PDF+audio vector space.
 
 ---
 
