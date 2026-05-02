@@ -142,19 +142,22 @@ async def _sync_async(force_embed: bool) -> dict:
         elif cached.get('last_modified', '') != nb['last_modified']:
             dirty.append(nb['name'])
 
-    to_refresh = dirty + unknown
+    # Always refresh all notebooks: notebook-level last_modified is frozen at
+    # creation date for older notebooks (e.g. Health = 2013) and is never
+    # updated when pages are edited. Page-level last_modified (compared in
+    # modified_ids below) is the reliable change signal.
+    to_refresh = [nb['name'] for nb in fresh_nbs]
     before = _snapshot_pages(cache)
 
-    if to_refresh:
-        _set_step(f'refreshing {len(to_refresh)} notebook(s): {", ".join(to_refresh)}')
+    _set_step(f'refreshing {len(to_refresh)} notebook(s)')
 
-        async def _refresh_one(nb_name):
-            try:
-                return nb_name, await refresh_notebook(client, nb_name)
-            except Exception as e:
-                return nb_name, {'error': str(e)}
+    async def _refresh_one(nb_name):
+        try:
+            return nb_name, await refresh_notebook(client, nb_name)
+        except Exception as e:
+            return nb_name, {'error': str(e)}
 
-        await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
+    await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
 
     cache = _load_cache()
     after = _snapshot_pages(cache)
@@ -201,6 +204,7 @@ async def _sync_async(force_embed: bool) -> dict:
     embed_result = build_embeddings(force=force_embed)
 
     return {
+        'notebooks_refreshed': len(to_refresh),
         'notebooks_dirty':    len(dirty),
         'notebooks_unknown':  len(unknown),
         'pages_added':        len(added_ids),
@@ -296,8 +300,8 @@ def cmd_sync(args) -> int:
             'pages_del':     result['pages_deleted'],
             'fetched':       result['pages_fetched'],
             'fetch_failed':  result['pages_fetch_failed'],
-            'embed_rebuilt': result['embeddings'].get('rebuilt', 0),
-            'embed_reused':  result['embeddings'].get('reused',  0),
+            'embed_rebuilt': result['embeddings'].get('pages_rebuilt', result['embeddings'].get('rebuilt', 0)),
+            'embed_reused':  result['embeddings'].get('chunks_reused', result['embeddings'].get('reused', 0)),
         })
     if 'error' in state:
         log_row['error'] = state['error']
@@ -322,11 +326,10 @@ def cmd_sync(args) -> int:
 
     print(
         f"sync done in {state['elapsed_sec']}s: "
-        f"nb dirty={result['notebooks_dirty']}, "
-        f"new={result['notebooks_unknown']}, "
+        f"nb refreshed={result['notebooks_refreshed']} (dirty={result['notebooks_dirty']} new={result['notebooks_unknown']}), "
         f"pages +{result['pages_added']} ~{result['pages_modified']} -{result['pages_deleted']}, "
         f"fetched={result['pages_fetched']} failed={result['pages_fetch_failed']}, "
-        f"embed rebuilt={result['embeddings']['rebuilt']} reused={result['embeddings']['reused']}"
+        f"embed pages_rebuilt={result['embeddings'].get('pages_rebuilt', result['embeddings'].get('rebuilt', 0))} chunks_embedded={result['embeddings'].get('chunks_embedded', 0)} chunks_reused={result['embeddings'].get('chunks_reused', result['embeddings'].get('reused', 0))}"
     )
     return 0
 
@@ -399,7 +402,7 @@ def cmd_status(args) -> int:
                       f"pages +{s.get('pages_added','?')} "
                       f"~{s.get('pages_modified','?')} "
                       f"-{s.get('pages_deleted','?')}, "
-                      f"embed rebuilt={s.get('embeddings',{}).get('rebuilt','?')})")
+                      f"embed pages_rebuilt={s.get('embeddings',{}).get('pages_rebuilt', s.get('embeddings',{}).get('rebuilt','?'))})")
             else:
                 print(f"idle  last sync FAILED @ {st.get('finished_at','?')}: "
                       f"{st.get('error','?')}")

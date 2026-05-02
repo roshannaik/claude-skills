@@ -1,6 +1,6 @@
 ---
 name: onenote
-description: Read and search OneNote notebooks. Use when asked to find information in my OneNote notes, answer questions from them, or read or list sections and pages.
+description: Read and search my notes in OneNote notebooks. Use when asked to find information in my notes, answer questions from them, just read pages or list sections and pages.
 argument-hint: 'query "my latest lab tests", read Health/Supplements, list sections in Home Stuff'
 allowed-tools: Bash, Read
 author: Roshan Naik

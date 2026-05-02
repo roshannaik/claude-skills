@@ -220,6 +220,8 @@ Tail it any time: `tail -f cache/sync.log | jq .`
 
 If a sync wedges (e.g. Graph API hangs), it self-kills via `SIGALRM` after `--max-duration` seconds (default 600) and logs `status: "timeout"`. As a belt-and-suspenders measure, the lockfile body carries `{pid, started_at, hostname}`, so `sync.py unstick` can find and `SIGTERM/SIGKILL` the owning process even if the heartbeat was never written.
 
+**Cache consistency on timeout or crash:** all writes go through `atomic_write` / `atomic_savez` (write to `.tmp.{pid}` → fsync → `os.replace`), so a kill mid-write leaves the previous file intact — never a partial/corrupt state. On a clean `DurationExceeded` timeout, `build_embeddings` saves partial embedding progress before propagating the exception, so completed vectors aren't re-computed on the next run. The only side effects are orphaned `.tmp.{pid}` files (harmless, overwritten on next write) and pages whose embeddings were not yet reached (rebuilt on next sync). Page HTML uses a write-ordering guarantee: `.html` is written before `.meta`; readers key off `.meta`, so an interrupted HTML write is invisible to queries (treated as a cache miss, triggers a refetch).
+
 ---
 
 ## Usage
@@ -495,7 +497,15 @@ If corpus scale grows 10× or privacy demands on-device: Tesseract (OCR), Whispe
 
 ## What gets cached
 
-The skill caches API responses and derived artifacts locally for speed:
+The skill caches API responses and derived artifacts locally for speed.
+
+Three subdirectories hold page data — they are complementary layers, not duplicates:
+
+| Directory | What's in it | Size (typical) | Regenerable? |
+|---|---|---|---|
+| `page_content/` | Raw HTML for each page fetched from Graph, plus a `.meta` file storing `last_modified` for invalidation. The canonical page text. | ~16 MB | Yes — one Graph API call per page |
+| `page_resources/` | Binary media embedded in those pages (PNG/JPG/PDF/MP4) plus Gemini-derived sidecar files (`.ocr.txt`, `.caption.txt`, `.transcript.txt`) and `.meta.json` per resource. The bulk of disk usage. | ~650 MB | Media: yes (Graph). Derived text: yes (Gemini, costs ~$0.001/item) |
+| `page_rendered/` | Browser-viewable HTML written by `render-page` — identical to `page_content/` HTML but with `<img src>` rewritten to `file://` local paths so the page loads offline without auth. Generated on-demand, never auto-synced. | <1 MB | Yes — instant, no API |
 
 **Graph-fetched source:**
 - `cache/onenote_cache.json` — full notebook/section/page index (never read directly — too large)
@@ -503,6 +513,7 @@ The skill caches API responses and derived artifacts locally for speed:
 - `cache/page_content/<safe_pid>.html` + `.meta` — individual page HTML snapshots, invalidated by `last_modified`
 - `cache/page_resources/<safe_rid>.<ext>` — raw image / PDF / audio / video bytes fetched from Graph `/onenote/resources/{id}/content`
 - `cache/page_resources/<safe_rid>.meta.json` — `{mime, filename, kind, size, fetched_at, page_ids: [...]}` per resource
+- `cache/page_rendered/<safe_pid>.html` — browser-viewable HTML (local `file://` image srcs); written by `render-page`, on-demand only
 
 **LLM-derived artifacts (one-shot per item, reused forever):**
 - `cache/page_resources/<safe_rid>.ocr.txt` — Gemini-flash OCR of images (when ≥30 non-ws chars)

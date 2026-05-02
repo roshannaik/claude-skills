@@ -28,6 +28,7 @@ from onenote_cache import (
 )
 from onenote_chunks import chunk_page, Chunk
 from onenote_genai import get_client, with_retry
+from onenote_lock import DurationExceeded
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,8 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         nonlocal successes_since_ckpt
         try:
             vec_list = _embed_with_retry(client, [content], 'RETRIEVAL_DOCUMENT')
+        except DurationExceeded:
+            raise
         except Exception as e:
             print(f'  ! {label} failed {c.chunk_id}: {e}', file=sys.stderr)
             return
@@ -353,6 +356,8 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         for i, (c, pid, pm) in enumerate(media_chunks, 1):
             try:
                 content = _chunk_content(c)
+            except DurationExceeded:
+                raise
             except Exception as e:
                 print(f'  ! media prep failed {c.chunk_id}: {e}', file=sys.stderr)
                 continue
@@ -364,7 +369,7 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
                       file=sys.stderr)
             if i < len(media_chunks):
                 time.sleep(INTER_CALL_SLEEP)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, DurationExceeded):
         print('\nInterrupted — saving partial progress.', file=sys.stderr)
         _merge_and_save()
         raise
