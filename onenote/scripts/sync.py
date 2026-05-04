@@ -558,6 +558,8 @@ def main() -> int:
     sub.add_parser('unstick', help='kill hung sync and clean up files')
 
     args = ap.parse_args()
+    if not args.cmd:
+        args.cmd = 'sync'
     return {
         'sync':    cmd_sync,
         'status':  cmd_status,
