@@ -21,6 +21,24 @@ def is_transient_error(err: Exception) -> bool:
             or any(sub in low for sub in _TRANSIENT_SUBSTRINGS))
 
 
+def _api_retry_delay(err: Exception) -> float | None:
+    """Extract the server-suggested retry delay (seconds) from a 429 response body.
+
+    Google's API embeds a RetryInfo proto at:
+      err.details['error']['details'][n]['retryDelay']  e.g. '30s'
+    Returns None if the hint is absent or unparseable.
+    """
+    try:
+        details = err.details  # type: ignore[attr-defined]
+        for d in details.get('error', {}).get('details', []):
+            val = d.get('retryDelay', '')
+            if val.endswith('s'):
+                return float(val[:-1])
+    except Exception:
+        pass
+    return None
+
+
 def get_client():
     """Return a google-genai Client using GEMINI_API_KEY or GOOGLE_API_KEY."""
     from google import genai
@@ -34,6 +52,8 @@ def with_retry(fn, *args, max_attempts: int = 6, base_wait: float = 4.0,
                max_wait: float = 60.0, label: str = '', **kwargs):
     """Invoke fn(*args, **kwargs) with exponential backoff on transient errors.
 
+    Uses the server-supplied retryDelay hint from 429 responses when present;
+    falls back to exponential backoff otherwise.
     Non-transient errors (auth, invalid arg, oversized payload) raise immediately.
     On final-attempt transient failure, re-raises the last exception.
     """
@@ -45,9 +65,12 @@ def with_retry(fn, *args, max_attempts: int = 6, base_wait: float = 4.0,
             last = e
             if attempt == max_attempts - 1 or not is_transient_error(e):
                 raise
-            wait = min(max_wait, base_wait * (2 ** attempt))
+            hint = _api_retry_delay(e)
+            wait = (hint + 0.3) if hint is not None else min(max_wait, base_wait * (2 ** attempt))
+            wait = min(wait, max_wait)
             tag = f'{label}: ' if label else ''
-            print(f'  ! {tag}transient ({str(e)[:80]}); sleep {wait:.0f}s '
+            source = 'server hint' if hint is not None else 'backoff'
+            print(f'  ! {tag}transient ({str(e)[:80]}); sleep {wait:.0f}s [{source}] '
                   f'(attempt {attempt+1}/{max_attempts})', file=sys.stderr)
             time.sleep(wait)
     raise last  # unreachable, but satisfies type checkers

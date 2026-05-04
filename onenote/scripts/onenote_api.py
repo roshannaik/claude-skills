@@ -135,7 +135,8 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
     return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
 
 
-async def find_pages_batch(client=None, page_specs: list[dict] = None) -> list[dict]:
+async def find_pages_batch(client=None, page_specs: list[dict] = None,
+                           on_progress=None) -> list[dict]:
     """Fetch multiple pages in parallel.
 
     page_specs = [{'notebook': ..., 'section': ..., 'page': ...}, ...]
@@ -143,13 +144,18 @@ async def find_pages_batch(client=None, page_specs: list[dict] = None) -> list[d
 
     `client` is optional. If every page in the batch is a cache hit, no Graph
     client is ever constructed.
+
+    on_progress: optional callable() called after each page completes (success or failure).
     """
     async def _fetch(spec):
         try:
-            return await find_page(client=client, notebook_name=spec['notebook'],
-                                   section_name=spec['section'], page_title=spec['page'])
+            result = await find_page(client=client, notebook_name=spec['notebook'],
+                                     section_name=spec['section'], page_title=spec['page'])
         except Exception as e:
-            return {'title': spec.get('page', ''), 'content': '', 'html': '', 'error': str(e)}
+            result = {'title': spec.get('page', ''), 'content': '', 'html': '', 'error': str(e)}
+        if on_progress is not None:
+            on_progress(spec, result)
+        return result
     return list(await asyncio.gather(*[_fetch(s) for s in page_specs]))
 
 

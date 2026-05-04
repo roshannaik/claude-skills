@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,9 +41,9 @@ EMBED_DIM           = 768
 # gemini-embedding-2-preview returns exactly ONE embedding per call, even when
 # given multiple contents (the model concatenates the list into a single
 # document). So we call one chunk at a time.
-INTER_CALL_SLEEP    = 0.3     # between embed calls to stay under RPM
 MAX_RETRIES         = 6
 CHECKPOINT_EVERY    = 50      # save partial state every N embed successes
+MAX_CONCURRENT      = 8       # parallel embed calls; retryDelay from 429s self-tunes throughput
 
 EMBEDDINGS_NPZ      = REFS_DIR / 'embeddings.npz'
 EMBEDDINGS_META     = REFS_DIR / 'embeddings_meta.json'
@@ -201,7 +202,9 @@ def _resolve_page_ids(page_ids: list, pages_file: str) -> list:
 
 
 def build_embeddings(page_ids: list = None, pages_file: str = None,
-                     force: bool = False) -> dict:
+                     force: bool = False,
+                     deleted_page_ids: set = None,
+                     on_page_embedded=None) -> dict:
     """(Re)build the embedding store for a subset of pages.
 
     Args:
@@ -268,9 +271,16 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         for c in chunks:
             all_chunks.append((c, pid, page_meta))
 
-    # Chunks we need to embed (skip those already in existing_vecs on non-force)
+    # Chunks we need to embed. For pages being rebuilt, always re-embed text and
+    # summary chunks — their IDs are position-based so stale vectors may survive
+    # a heavy edit. Media chunk IDs are tied to resource_id (stable content key)
+    # so they are safe to reuse when unchanged.
+    rebuilt_pids = set(pages_to_rebuild.keys())
     need_embed = [(c, pid, pm) for c, pid, pm in all_chunks
-                  if force or c.chunk_id not in existing_vecs]
+                  if force
+                  or c.chunk_id not in existing_vecs
+                  or (pid in rebuilt_pids
+                      and c.kind not in ('image', 'pdf', 'audio'))]
 
     carry_count = len(all_chunks) - len(need_embed)
     print(f'Pages targeted: {len(target_pids)}; '
@@ -280,26 +290,44 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
           file=sys.stderr)
 
     # ---- Embed ----
+    # Concurrent embedding: MAX_CONCURRENT worker threads call the API in
+    # parallel; retryDelay hints from 429 responses (see onenote_genai.with_retry)
+    # self-tune throughput without a fixed sleep. Workers mutate new_vecs /
+    # new_kinds / new_chunks_meta under store_lock; the main thread (in
+    # _run_concurrent and _merge_and_save) snapshots them under the same lock.
     new_vecs  = {}
     new_kinds = {}
     new_chunks_meta = {}
+    store_lock = threading.Lock()
     successes_since_ckpt = 0
 
     t0 = time.time()
 
     def _merge_and_save():
-        """Snapshot current progress to disk. Safe to call multiple times."""
+        """Snapshot current progress to disk. Safe to call multiple times.
+        Snapshots new_* dicts under store_lock so workers can mutate them
+        concurrently without tearing the saved state."""
+        with store_lock:
+            snap_vecs        = dict(new_vecs)
+            snap_kinds       = dict(new_kinds)
+            snap_chunks_meta = dict(new_chunks_meta)
+
         merged_vecs  = dict(existing_vecs) if not force else {}
         merged_kinds = {cid: (meta.get('chunks', {}).get(cid, {}).get('kind') or '')
                         for cid in existing_vecs} if not force else {}
-        merged_vecs.update(new_vecs)
-        merged_kinds.update(new_kinds)
+        merged_vecs.update(snap_vecs)
+        merged_kinds.update(snap_kinds)
 
         merged_chunks_meta = {} if force else dict(meta.get('chunks', {}))
-        merged_chunks_meta.update(new_chunks_meta)
+        merged_chunks_meta.update(snap_chunks_meta)
 
         merged_pages_meta = {} if force else dict(meta.get('pages', {}))
         merged_pages_meta.update(pages_to_rebuild)
+
+        # Purge explicitly deleted pages before the live-chunk filter runs.
+        if deleted_page_ids:
+            for pid in deleted_page_ids:
+                merged_pages_meta.pop(pid, None)
 
         # Filter to live chunk_ids only
         live = set()
@@ -311,64 +339,110 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
             merged_chunks_meta = {k: v for k, v in merged_chunks_meta.items() if k in live}
         _save_state(merged_vecs, merged_kinds, merged_pages_meta, merged_chunks_meta)
 
-    # gemini-embedding-2-preview supports only one item per call, so we walk
-    # all chunks sequentially (text first, media after — just for readability
-    # of the progress log).
+    # gemini-embedding-2-preview supports only one item per call.
     text_chunks  = [(c, pid, pm) for c, pid, pm in need_embed if _is_text_kind(c)]
     media_chunks = [(c, pid, pm) for c, pid, pm in need_embed if not _is_text_kind(c)]
 
-    def _embed_and_store(c, content, label, idx, total):
-        nonlocal successes_since_ckpt
+    def _embed_one(c, content):
+        """Embed one chunk and store result. Called from worker threads."""
         try:
             vec_list = _embed_with_retry(client, [content], 'RETRIEVAL_DOCUMENT')
         except DurationExceeded:
             raise
         except Exception as e:
-            print(f'  ! {label} failed {c.chunk_id}: {e}', file=sys.stderr)
-            return
+            with store_lock:
+                print(f'  ! embed failed {c.chunk_id}: {e}', file=sys.stderr)
+            return False
         if not vec_list:
-            print(f'  ! {label} no embedding for {c.chunk_id}', file=sys.stderr)
-            return
+            with store_lock:
+                print(f'  ! no embedding for {c.chunk_id}', file=sys.stderr)
+            return False
         arr = np.asarray(vec_list[0], dtype=np.float32)
         n = np.linalg.norm(arr)
         if n == 0 or not np.isfinite(arr).all():
-            print(f'  ! {label} bad vector for {c.chunk_id}', file=sys.stderr)
-            return
-        new_vecs[c.chunk_id] = (arr / n)
-        new_kinds[c.chunk_id] = c.kind
-        new_chunks_meta[c.chunk_id] = c.as_meta()
-        successes_since_ckpt += 1
-        if idx % 20 == 0 or idx == total:
-            print(f'  {label} [{idx}/{total}] {c.kind:17s} {c.chunk_id[-24:]}',
-                  file=sys.stderr)
+            with store_lock:
+                print(f'  ! bad vector for {c.chunk_id}', file=sys.stderr)
+            return False
+        with store_lock:
+            new_vecs[c.chunk_id] = arr / n
+            new_kinds[c.chunk_id] = c.kind
+            new_chunks_meta[c.chunk_id] = c.as_meta()
+        return True
+
+    def _run_concurrent(jobs):
+        """Submit jobs to thread pool; page-level progress tracked in main thread.
+
+        jobs: [(c, content, pid), ...]
+        Calls on_page_embedded(nb, sec, title, n_chunks, page_num, total_pages)
+        when all chunks for a page complete.
+        """
+        nonlocal successes_since_ckpt
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Per-page chunk counts (frozen before any threads start)
+        page_chunk_total: dict = {}
+        for c, content, pid in jobs:
+            page_chunk_total[pid] = page_chunk_total.get(pid, 0) + 1
+        page_chunk_done: dict = {pid: 0 for pid in page_chunk_total}
+        total_pages = len(page_chunk_total)
+        pages_done_count = [0]
+
+        executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+        futures = {executor.submit(_embed_one, c, content): (c, pid)
+                   for c, content, pid in jobs}
+        try:
+            for fut in as_completed(futures):
+                c, pid = futures[fut]
+                try:
+                    ok = fut.result()
+                except DurationExceeded:
+                    raise
+                except Exception as e:
+                    print(f'  ! unexpected: {e}', file=sys.stderr)
+                    continue
+                if not ok:
+                    continue
+                successes_since_ckpt += 1
+                # Per-page tracking runs on main thread — no lock needed
+                page_chunk_done[pid] += 1
+                if page_chunk_done[pid] == page_chunk_total[pid]:
+                    pages_done_count[0] += 1
+                    if on_page_embedded is not None:
+                        info = pages_to_rebuild.get(pid, {})
+                        on_page_embedded(
+                            info.get('notebook', ''),
+                            info.get('section', ''),
+                            info.get('title', ''),
+                            page_chunk_total[pid],
+                            pages_done_count[0],
+                            total_pages,
+                        )
+                if successes_since_ckpt >= CHECKPOINT_EVERY:
+                    _merge_and_save()
+                    successes_since_ckpt = 0
+                    print(f'  [checkpoint] saved partial state after {len(new_vecs)} new chunks',
+                          file=sys.stderr)
+        except (KeyboardInterrupt, DurationExceeded):
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=False)
 
     try:
-        for i, (c, pid, pm) in enumerate(text_chunks, 1):
-            _embed_and_store(c, c.embed_text, 'text ', i, len(text_chunks))
-            if successes_since_ckpt >= CHECKPOINT_EVERY:
-                _merge_and_save()
-                successes_since_ckpt = 0
-                print(f'  [checkpoint] saved partial state after {len(new_vecs)} new chunks',
-                      file=sys.stderr)
-            if i < len(text_chunks) or media_chunks:
-                time.sleep(INTER_CALL_SLEEP)
+        if text_chunks:
+            _run_concurrent([(c, c.embed_text, pid) for c, pid, pm in text_chunks])
 
-        for i, (c, pid, pm) in enumerate(media_chunks, 1):
+        media_jobs = []
+        for c, pid, pm in media_chunks:
             try:
-                content = _chunk_content(c)
+                media_jobs.append((c, _chunk_content(c), pid))
             except DurationExceeded:
                 raise
             except Exception as e:
                 print(f'  ! media prep failed {c.chunk_id}: {e}', file=sys.stderr)
-                continue
-            _embed_and_store(c, content, 'media', i, len(media_chunks))
-            if successes_since_ckpt >= CHECKPOINT_EVERY:
-                _merge_and_save()
-                successes_since_ckpt = 0
-                print(f'  [checkpoint] saved partial state after {len(new_vecs)} new chunks',
-                      file=sys.stderr)
-            if i < len(media_chunks):
-                time.sleep(INTER_CALL_SLEEP)
+        if media_jobs:
+            _run_concurrent(media_jobs)
+
     except (KeyboardInterrupt, DurationExceeded):
         print('\nInterrupted — saving partial progress.', file=sys.stderr)
         _merge_and_save()

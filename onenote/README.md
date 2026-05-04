@@ -139,7 +139,8 @@ Newly shared notebooks need to be opened at least once in OneNote (web, desktop,
 
 ```bash
 python3 $SKILL_ROOT/onenote/scripts/sync.py                  # sync now
-python3 $SKILL_ROOT/onenote/scripts/sync.py status           # idle / running
+python3 $SKILL_ROOT/onenote/scripts/sync.py sync --verbose   # per-page progress for each step
+python3 $SKILL_ROOT/onenote/scripts/sync.py status           # idle / running (shows step elapsed + done/total)
 python3 $SKILL_ROOT/onenote/scripts/sync.py unstick          # kill a hung sync
 ```
 

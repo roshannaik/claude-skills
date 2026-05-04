@@ -21,7 +21,7 @@ self-kill, so a sync can never wedge launchd indefinitely.
 One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 
 Subcommands:
-  sync.py [sync] [--force-embed] [--quiet] [--max-duration N]
+  sync.py [sync] [--force-embed] [--quiet] [--verbose] [--max-duration N]
   sync.py status                              report idle / running state
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
 """
@@ -53,6 +53,14 @@ LOG_FILE       = REFS_DIR / 'sync.log'
 HEARTBEAT_INTERVAL  = 5.0
 DEFAULT_MAX_SECONDS = 600
 
+# ---------------------------------------------------------------------------
+# Step timing + progress (module-level, updated by _set_step / _set_progress)
+# ---------------------------------------------------------------------------
+
+_step_t0: float          = 0.0       # perf_counter() when current step started
+_step_started_at_iso: str = ''        # UTC ISO timestamp for the same moment
+_step_progress: dict      = {}        # {'done': int, 'total': int} or empty
+
 
 def _append_log(row: dict) -> None:
     """Append one JSONL row to sync.log. Best-effort — never raises."""
@@ -68,22 +76,45 @@ def _append_log(row: dict) -> None:
 # Heartbeat
 # ---------------------------------------------------------------------------
 
-_current_step: str = 'starting'
+_current_step: str = ''   # empty = no active step (initial or finalized)
 _stop_heartbeat = threading.Event()
 
 
-def _set_step(step: str) -> None:
-    global _current_step
-    _current_step = step
-    _write_heartbeat()
+def _set_step(step: str | None) -> None:
+    """Transition to a new step, or finalize the current one.
+
+    Prints `done (Xs)` for the prior step (if any) then `<step> ...` for
+    the new one. Pass None or '' to close out the last step without
+    starting a new one (e.g. at end of sync).
+    """
+    global _current_step, _step_t0, _step_started_at_iso, _step_progress
+    now_perf = time.perf_counter()
+    if _current_step:
+        print(f'  done ({now_perf - _step_t0:.1f}s)', flush=True)
+    _current_step = step or ''
+    _step_t0 = now_perf
+    _step_progress = {}
+    if step:
+        _step_started_at_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        print(f'{step} ...', flush=True)
+        _write_heartbeat()
+
+
+def _set_progress(done: int, total: int) -> None:
+    global _step_progress
+    _step_progress = {'done': done, 'total': total}
 
 
 def _write_heartbeat() -> None:
-    atomic_write(HEARTBEAT_FILE, json.dumps({
-        'pid':  os.getpid(),
-        'step': _current_step,
-        'ts':   datetime.now(timezone.utc).isoformat(timespec='seconds'),
-    }))
+    payload: dict = {
+        'pid':             os.getpid(),
+        'step':            _current_step,
+        'step_started_at': _step_started_at_iso,
+        'ts':              datetime.now(timezone.utc).isoformat(timespec='seconds'),
+    }
+    if _step_progress:
+        payload['progress'] = _step_progress
+    atomic_write(HEARTBEAT_FILE, json.dumps(payload))
 
 
 def _heartbeat_loop() -> None:
@@ -124,7 +155,7 @@ def _snapshot_pages(cache: dict) -> dict:
 # Main sync flow
 # ---------------------------------------------------------------------------
 
-async def _sync_async(force_embed: bool) -> dict:
+async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
     from onenote_api import refresh_notebook, find_pages_batch
 
@@ -150,12 +181,18 @@ async def _sync_async(force_embed: bool) -> dict:
     before = _snapshot_pages(cache)
 
     _set_step(f'refreshing {len(to_refresh)} notebook(s)')
+    refresh_done = [0]
 
     async def _refresh_one(nb_name):
         try:
-            return nb_name, await refresh_notebook(client, nb_name)
+            result = nb_name, await refresh_notebook(client, nb_name)
         except Exception as e:
-            return nb_name, {'error': str(e)}
+            result = nb_name, {'error': str(e)}
+        refresh_done[0] += 1
+        if verbose:
+            status = '' if 'error' not in result[1] else f'  [error: {result[1]["error"][:50]}]'
+            print(f'  [{refresh_done[0]}/{len(to_refresh)}] {nb_name}{status}', flush=True)
+        return result
 
     await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
 
@@ -187,11 +224,24 @@ async def _sync_async(force_embed: bool) -> dict:
     to_fetch_ids = added_ids | modified_ids
     if to_fetch_ids:
         _set_step(f'fetching {len(to_fetch_ids)} new/modified page(s)')
+        total_fetch = len(to_fetch_ids)
+        _set_progress(0, total_fetch)
+        done_count = 0
+
+        def _on_page_done(spec, result):
+            nonlocal done_count
+            done_count += 1
+            _set_progress(done_count, total_fetch)
+            if verbose:
+                label = f'{spec["notebook"]} / {spec["section"]} / {spec["page"]}'
+                suffix = f'  [error: {result["error"][:50]}]' if 'error' in result else ''
+                print(f'  [{done_count}/{total_fetch}] {label}{suffix}', flush=True)
+
         specs = [{'notebook': after[pid][0],
                   'section':  after[pid][1],
                   'page':     after[pid][2]}
                  for pid in to_fetch_ids]
-        results = await find_pages_batch(client, specs)
+        results = await find_pages_batch(client, specs, on_progress=_on_page_done)
         for r in results:
             if 'error' in r:
                 failed += 1
@@ -201,7 +251,14 @@ async def _sync_async(force_embed: bool) -> dict:
     # Incremental embeddings rebuild (also drops vectors for deleted page IDs)
     _set_step('building embeddings')
     from onenote_embeddings import build_embeddings
-    embed_result = build_embeddings(force=force_embed)
+
+    def _on_page_embedded(nb, sec, title, n_chunks, page_num, total_pages):
+        print(f'  [page {page_num}/{total_pages}] {nb} / {sec} / {title} — {n_chunks} chunks', flush=True)
+
+    embed_result = build_embeddings(force=force_embed, deleted_page_ids=deleted_ids,
+                                    on_page_embedded=_on_page_embedded if verbose else None)
+
+    _set_step(None)  # finalize the last step's "done (Xs)" line
 
     return {
         'notebooks_refreshed': len(to_refresh),
@@ -243,7 +300,6 @@ def cmd_sync(args) -> int:
     lock_fd.flush()
     os.fsync(lock_fd.fileno())
 
-    _set_step('starting')
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
     hb_thread.start()
 
@@ -253,7 +309,7 @@ def cmd_sync(args) -> int:
 
     try:
         with duration_limit(args.max_duration, 'sync'):
-            result = asyncio.run(_sync_async(force_embed=args.force_embed))
+            result = asyncio.run(_sync_async(force_embed=args.force_embed, verbose=args.verbose))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'elapsed_sec': round(time.perf_counter() - t0, 1),
@@ -374,22 +430,35 @@ def cmd_status(args) -> int:
         pid  = body.get('pid') or hb.get('pid', '?')
         step = hb.get('step', 'starting')
         started = body.get('started_at', '?')
+        now = datetime.now(timezone.utc)
+
         elapsed_s = ''
         try:
-            elapsed = (datetime.now(timezone.utc)
-                       - datetime.fromisoformat(started)).total_seconds()
+            elapsed = (now - datetime.fromisoformat(started)).total_seconds()
             elapsed_s = f", elapsed {int(elapsed)}s"
         except Exception:
             pass
+
+        step_s = ''
+        try:
+            step_elapsed = (now - datetime.fromisoformat(hb['step_started_at'])).total_seconds()
+            step_s = f" (step {int(step_elapsed)}s"
+            prog = hb.get('progress', {})
+            if prog:
+                step_s += f", {prog['done']}/{prog['total']}"
+            step_s += ')'
+        except Exception:
+            pass
+
         beat_s = ''
         if hb:
             try:
-                age = (datetime.now(timezone.utc)
-                       - datetime.fromisoformat(hb.get('ts', ''))).total_seconds()
+                age = (now - datetime.fromisoformat(hb.get('ts', ''))).total_seconds()
                 beat_s = f", last beat {int(age)}s ago"
             except Exception:
                 pass
-        print(f"running  pid={pid}  step={step}{elapsed_s}{beat_s}")
+
+        print(f"running  pid={pid}  step={step}{step_s}{elapsed_s}{beat_s}")
         return 0
 
     if STATE_FILE.exists():
@@ -461,6 +530,11 @@ def cmd_unstick(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description='OneNote skill sync')
+    # `cmd` defaults to 'sync' so bare `sync.py` works; subparser sets defaults
+    # for sync-only flags so we don't need a per-flag fallback when no
+    # subcommand is given.
+    ap.set_defaults(cmd='sync', force_embed=False, quiet=False, verbose=False,
+                    max_duration=DEFAULT_MAX_SECONDS)
     sub = ap.add_subparsers(dest='cmd')
 
     ps = sub.add_parser('sync', help='sync now (default if no subcommand)')
@@ -468,6 +542,8 @@ def main() -> int:
                     help='force full embedding rebuild')
     ps.add_argument('--quiet', action='store_true',
                     help='print summary only when changes were applied')
+    ps.add_argument('--verbose', '-v', action='store_true',
+                    help='print per-page progress for each step')
     ps.add_argument('--max-duration', type=int, default=DEFAULT_MAX_SECONDS,
                     help=f'seconds before SIGALRM self-kill (default {DEFAULT_MAX_SECONDS}, 0 disables)')
 
@@ -475,12 +551,6 @@ def main() -> int:
     sub.add_parser('unstick', help='kill hung sync and clean up files')
 
     args = ap.parse_args()
-    if args.cmd is None:
-        args.cmd = 'sync'
-        args.force_embed = False
-        args.quiet = False
-        args.max_duration = DEFAULT_MAX_SECONDS
-
     return {
         'sync':    cmd_sync,
         'status':  cmd_status,
