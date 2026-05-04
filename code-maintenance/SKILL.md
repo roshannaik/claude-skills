@@ -69,13 +69,29 @@ Two things doing the same job.
 - Copy-pasted logic that could be a shared helper
 - Repeated string literals that should be constants
 
-### D — Stale documentation
-Docs that describe code that no longer exists, or code that exists but isn't documented.
+### D — Stale / incomplete documentation
+Check both directions: docs that describe code that no longer exists, AND code that exists but isn't documented.
 
-- SKILL.md examples using old function names, old paths, old CLI flags
+**Doc → code (stale claims)**
+- Function names, paths, or CLI flags in docs that no longer match the code
 - Docstrings that describe old parameter names or return shapes
 - Comments referencing behavior that changed
-- Missing docs for new functions added without updating README/SKILL.md
+- Example invocations in README/SKILL.md that use removed or renamed symbols
+
+**Code → doc (missing coverage)**
+- Public functions, classes, or CLI commands added since the last doc update, with no entry in README/SKILL.md
+- New config keys or environment variables that aren't mentioned in docs
+- Behavioural changes to existing features whose doc description is now inaccurate
+
+**How to check**
+1. Collect every public symbol (functions, classes, CLI args) from the code files in scope.
+2. Grep each symbol name in all doc files (README, SKILL.md, docstrings).
+3. Flag symbols with zero doc hits as potentially undocumented.
+4. Collect every symbol name, path, and flag mentioned in the doc files.
+5. Grep each one in the code files.
+6. Flag doc references with zero code hits as potentially stale.
+
+Apply judgment: internal helpers (`_foo`), test utilities, and deliberately private symbols don't need public docs. Only flag the gap if a reasonable reader of the docs would be surprised.
 
 ### E — Simplification opportunities
 Equivalent code that can be expressed more simply without affecting behavior.
