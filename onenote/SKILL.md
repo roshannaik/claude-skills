@@ -1,7 +1,7 @@
 ---
 name: onenote
-description: Read and search my notes in OneNote notebooks. Use when asked to find information in my notes, answer questions from them, just read pages or list sections and pages.
-argument-hint: 'query "my latest lab tests", read Health/Supplements, list sections in Home Stuff'
+description: Read and search my notes in OneNote notebooks. Use when asked to find information in my notes, answer questions from them, just read pages or list sections and pages. Also handles sync requests ("sync", "refresh the cache").
+argument-hint: 'query "my latest lab tests", read Health/Supplements, list sections in Home Stuff, sync'
 allowed-tools: Bash, Read
 author: Roshan Naik
 metadata:
@@ -224,6 +224,18 @@ python3 scripts/onenote_ops.py fetch-media --unstick       # SIGTERM (then SIGKI
 ```
 
 All three ingest steps are incremental — unchanged content is carried forward via `last_modified` checks. First full build ≈ $2 of paid-tier Gemini usage; incremental refreshes are pennies.
+
+---
+
+## Sync
+
+If the user asks to sync, refresh the cache, or update the cache, run:
+
+```bash
+python3 $SKILL_ROOT/onenote/scripts/sync.py 2>&1
+```
+
+Report the summary line from the output (pages added/modified/deleted, embed rebuilt). Do not run a sync unless the user explicitly requests it.
 
 ---
 
