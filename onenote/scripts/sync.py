@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from onenote_cache import (
-    REFS_DIR, _content_path, _load_cache, atomic_write,
+    REFS_DIR, _content_path, _load_cache, load_content_cache, atomic_write,
 )
 from onenote_lock import duration_limit, DurationExceeded as SyncTimeout
 
@@ -220,11 +220,12 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
                     pass
 
     # Pre-fetch HTML for added + modified pages so embeddings can embed them.
-    # Also include pages whose HTML is missing on disk (e.g. a prior sync timed
-    # out during the fetch step — last_modified is unchanged but no .html file).
+    # Also include pages whose HTML is not loadable: file missing OR .meta
+    # doesn't match last_modified (e.g. a prior sync timed out mid-fetch, or
+    # the meta was left stale after a section rename).
     missing_html_ids = {
         pid for pid in after_ids
-        if not _content_path(pid).with_suffix('.html').exists()
+        if load_content_cache(pid, after[pid][3]) is None
     }
     fetched = failed = 0
     to_fetch_ids = added_ids | modified_ids | missing_html_ids
