@@ -219,9 +219,15 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
                 except FileNotFoundError:
                     pass
 
-    # Pre-fetch HTML for added + modified pages so embeddings can embed them
+    # Pre-fetch HTML for added + modified pages so embeddings can embed them.
+    # Also include pages whose HTML is missing on disk (e.g. a prior sync timed
+    # out during the fetch step — last_modified is unchanged but no .html file).
+    missing_html_ids = {
+        pid for pid in after_ids
+        if not _content_path(pid).with_suffix('.html').exists()
+    }
     fetched = failed = 0
-    to_fetch_ids = added_ids | modified_ids
+    to_fetch_ids = added_ids | modified_ids | missing_html_ids
     if to_fetch_ids:
         _set_step(f'fetching {len(to_fetch_ids)} new/modified page(s)')
         total_fetch = len(to_fetch_ids)
