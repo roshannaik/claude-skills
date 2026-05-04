@@ -36,9 +36,10 @@ python3 scripts/build_embeddings.py                  # chunked embeddings, 768d
 python3 scripts/build_embeddings.py --force          # full rebuild (after model/format change)
 
 # Keep cache fresh in one shot (detects dirty notebooks via last_modified; re-embeds the delta)
-python3 scripts/sync.py
-python3 scripts/sync.py status     # idle | running (reports pid + start time)
-python3 scripts/sync.py unstick    # kill a hung sync
+python3 scripts/sync.py                      # sync with per-page progress (default)
+python3 scripts/sync.py sync --silent        # summary only, no per-page output
+python3 scripts/sync.py status               # idle | running (reports pid + start time)
+python3 scripts/sync.py unstick              # kill a hung sync
 ```
 
 Required env vars:

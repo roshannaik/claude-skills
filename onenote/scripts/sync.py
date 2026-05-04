@@ -21,7 +21,7 @@ self-kill, so a sync can never wedge launchd indefinitely.
 One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 
 Subcommands:
-  sync.py [sync] [--force-embed] [--quiet] [--verbose] [--max-duration N]
+  sync.py [sync] [--force-embed] [--quiet] [--silent] [--max-duration N]
   sync.py status                              report idle / running state
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
 """
@@ -540,7 +540,7 @@ def main() -> int:
     # `cmd` defaults to 'sync' so bare `sync.py` works; subparser sets defaults
     # for sync-only flags so we don't need a per-flag fallback when no
     # subcommand is given.
-    ap.set_defaults(cmd='sync', force_embed=False, quiet=False, verbose=False,
+    ap.set_defaults(cmd='sync', force_embed=False, quiet=False, verbose=True,
                     max_duration=DEFAULT_MAX_SECONDS)
     sub = ap.add_subparsers(dest='cmd')
 
@@ -549,8 +549,8 @@ def main() -> int:
                     help='force full embedding rebuild')
     ps.add_argument('--quiet', action='store_true',
                     help='print summary only when changes were applied')
-    ps.add_argument('--verbose', '-v', action='store_true',
-                    help='print per-page progress for each step')
+    ps.add_argument('--silent', '-s', action='store_false', dest='verbose',
+                    help='suppress per-page progress (summary line only)')
     ps.add_argument('--max-duration', type=int, default=DEFAULT_MAX_SECONDS,
                     help=f'seconds before SIGALRM self-kill (default {DEFAULT_MAX_SECONDS}, 0 disables)')
 
