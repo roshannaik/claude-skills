@@ -135,6 +135,45 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
     return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
 
 
+async def fetch_pages_by_id(client=None, items: list[dict] = None,
+                            on_progress=None) -> list[dict]:
+    """Fetch pages by page_id directly, bypassing title-based lookup.
+
+    items = [{'page_id': ..., 'last_modified': ..., 'label': '<for progress>'}, ...]
+
+    Use when the caller already knows the exact page_id (e.g. sync.py iterating
+    over snapshot diffs). Avoids the title-collision bug in find_page where
+    lookup_page returns the first match — duplicate titles within a section
+    cause one of the pages to never get fetched.
+
+    on_progress: optional callable(item, result) called after each completion.
+    """
+    def _lazy_client():
+        nonlocal client
+        if client is None:
+            from onenote_setup import make_graph_client
+            client = make_graph_client()
+        return client
+
+    async def _fetch(item):
+        pid = item['page_id']
+        lm  = item.get('last_modified', '')
+        try:
+            html = load_content_cache(pid, lm)
+            if html is None:
+                from onenote_setup import get_page_content
+                html = await get_page_content(_lazy_client(), pid)
+                save_content_cache(pid, html, lm)
+            result = {'id': pid, 'html': html}
+        except Exception as e:
+            result = {'id': pid, 'error': str(e)}
+        if on_progress is not None:
+            on_progress(item, result)
+        return result
+
+    return list(await asyncio.gather(*[_fetch(i) for i in items]))
+
+
 async def find_pages_batch(client=None, page_specs: list[dict] = None,
                            on_progress=None) -> list[dict]:
     """Fetch multiple pages in parallel.

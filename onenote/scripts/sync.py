@@ -157,7 +157,7 @@ def _snapshot_pages(cache: dict) -> dict:
 
 async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
-    from onenote_api import refresh_notebook, find_pages_batch
+    from onenote_api import refresh_notebook, fetch_pages_by_id
 
     client = make_graph_client()
 
@@ -235,44 +235,27 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
         _set_progress(0, total_fetch)
         done_count = 0
 
-        def _on_page_done(spec, result):
+        def _on_page_done(item, result):
             nonlocal done_count
             done_count += 1
             _set_progress(done_count, total_fetch)
             if verbose:
-                label = f'{spec["notebook"]} / {spec["section"]} / {spec["page"]}'
                 suffix = f'  [error: {result["error"][:50]}]' if 'error' in result else ''
-                print(f'  [{done_count}/{total_fetch}] {label}{suffix}', flush=True)
+                print(f'  [{done_count}/{total_fetch}] {item["label"]}{suffix}', flush=True)
 
-        specs = [{'notebook': after[pid][0],
-                  'section':  after[pid][1],
-                  'page':     after[pid][2]}
+        # Fetch by page_id directly. find_page's title-based lookup is
+        # ambiguous when a section has duplicate titles (legal in OneNote) —
+        # one page would never get fetched.
+        items = [{'page_id': pid,
+                  'last_modified': after[pid][3],
+                  'label': f'{after[pid][0]} / {after[pid][1]} / {after[pid][2]}'}
                  for pid in to_fetch_ids]
-        results = await find_pages_batch(client, specs, on_progress=_on_page_done)
+        results = await fetch_pages_by_id(client, items, on_progress=_on_page_done)
         for r in results:
             if 'error' in r:
                 failed += 1
             else:
                 fetched += 1
-
-        # Re-validate after fetch. Concurrent find_page calls that fall through
-        # to the API path call update_pages_cache, which rewrites cache.json
-        # mid-stream and can bump last_modified for sibling pages — leaving
-        # their .meta stale relative to the now-current cache. A second pass
-        # with the refreshed snapshot catches and re-fetches those.
-        fresh_after = _snapshot_pages(_load_cache())
-        stale_ids = [
-            pid for pid in to_fetch_ids
-            if pid in fresh_after and load_content_cache(pid, fresh_after[pid][3]) is None
-        ]
-        if stale_ids:
-            if verbose:
-                print(f'  re-fetching {len(stale_ids)} page(s) with stale .meta', flush=True)
-            stale_specs = [{'notebook': fresh_after[pid][0],
-                            'section':  fresh_after[pid][1],
-                            'page':     fresh_after[pid][2]}
-                           for pid in stale_ids]
-            await find_pages_batch(client, stale_specs)
 
     # Incremental embeddings rebuild (also drops vectors for deleted page IDs)
     _set_step('building embeddings')
