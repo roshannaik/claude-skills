@@ -255,6 +255,25 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
             else:
                 fetched += 1
 
+        # Re-validate after fetch. Concurrent find_page calls that fall through
+        # to the API path call update_pages_cache, which rewrites cache.json
+        # mid-stream and can bump last_modified for sibling pages — leaving
+        # their .meta stale relative to the now-current cache. A second pass
+        # with the refreshed snapshot catches and re-fetches those.
+        fresh_after = _snapshot_pages(_load_cache())
+        stale_ids = [
+            pid for pid in to_fetch_ids
+            if pid in fresh_after and load_content_cache(pid, fresh_after[pid][3]) is None
+        ]
+        if stale_ids:
+            if verbose:
+                print(f'  re-fetching {len(stale_ids)} page(s) with stale .meta', flush=True)
+            stale_specs = [{'notebook': fresh_after[pid][0],
+                            'section':  fresh_after[pid][1],
+                            'page':     fresh_after[pid][2]}
+                           for pid in stale_ids]
+            await find_pages_batch(client, stale_specs)
+
     # Incremental embeddings rebuild (also drops vectors for deleted page IDs)
     _set_step('building embeddings')
     from onenote_embeddings import build_embeddings
