@@ -770,10 +770,17 @@ def _print_cache_sizes(verbose: bool = False) -> None:
 
     print(f"\n[Cache: {REFS_DIR}]")
     total_bytes = total_files = 0
+    # Calculate sizes and sort by size descending
+    sizes_and_labels = []
     for label, paths in sections:
         size, n = _scan(paths)
         total_bytes += size
         total_files += n
+        sizes_and_labels.append((size, n, label))
+
+    sizes_and_labels.sort(key=lambda x: x[0], reverse=True)
+
+    for size, n, label in sizes_and_labels:
         print(f"  {label:<17} {_fmt_size(size):>10}   ({n:>5} files)")
     print(f"  {'─' * 17} {'─' * 10}   {'─' * 13}")
     print(f"  {'total':<17} {_fmt_size(total_bytes):>10}   ({total_files:>5} files)")
