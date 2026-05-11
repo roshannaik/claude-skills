@@ -24,7 +24,7 @@ from pathlib import Path
 
 from onenote_cache import (
     _load_cache, REFS_DIR, load_content_cache, atomic_write, atomic_savez,
-    iter_all_pages, pages_by_id,
+    iter_all_pages, pages_by_id, _parse_lm,
     PAGE_SUBJECTS_JSON, SUBJECT_OVERRIDES,
 )
 from onenote_chunks import chunk_page, Chunk
@@ -250,11 +250,19 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         pid_lm = p.get('last_modified', '')
         prev = meta['pages'].get(pid, {})
 
-        if (not force
-                and prev.get('last_modified') == pid_lm
-                and all(cid in existing_vecs for cid in prev.get('chunk_ids', []))):
-            # Carry-forward path: nothing to do for this page
-            continue
+        # Carry-forward: skip rebuild if the previously-embedded revision is
+        # at least as new as the cache currently claims. Strict equality would
+        # over-trigger on Graph's last_modified flutter (see _parse_lm comment
+        # in onenote_cache.py). Real edits move cache.lm strictly forward, so
+        # prev_emb.lm >= pid_lm captures both "no change" and "cache rolled
+        # back to an older Graph response".
+        if not force and all(cid in existing_vecs for cid in prev.get('chunk_ids', [])):
+            prev_lm = prev.get('last_modified', '')
+            if prev_lm == pid_lm:
+                continue
+            pm, cm = _parse_lm(prev_lm), _parse_lm(pid_lm)
+            if pm is not None and cm is not None and pm >= cm:
+                continue
 
         html = load_content_cache(pid, pid_lm)
         if html is None:

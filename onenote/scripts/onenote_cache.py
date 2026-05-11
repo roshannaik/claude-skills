@@ -160,12 +160,57 @@ def _content_path(page_id: str) -> Path:
     safe = page_id.replace('!', '_').replace('/', '_')
     return PAGE_CONTENT_DIR / f'{safe}.html'
 
+def _parse_lm(s: str):
+    """Parse a Graph last_modified string. Returns datetime or None.
+    Tolerates with/without microseconds and ' '/'T' between date and time."""
+    if not s:
+        return None
+    s = s.strip().replace('T', ' ', 1)
+    from datetime import datetime
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f%z', '%Y-%m-%d %H:%M:%S%z'):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def load_content_cache(page_id: str, expected_modified: str) -> str:
+    """Return cached HTML if .meta is at least as new as expected_modified.
+
+    Strict equality first (fast path). If that fails, parse both sides as
+    datetimes — if .meta is >= expected, use the HTML. Only return None when
+    cache claims a strictly newer revision (a real edit) or HTML/.meta is
+    missing.
+
+    Why the tolerance — Microsoft Graph `lastModifiedDateTime` flutter:
+    The OneNote section pages-list endpoint (`GET /me/onenote/sections/{id}/pages`)
+    returns DIFFERENT lastModifiedDateTime values for the same page across calls.
+    Not just format drift (with vs without microseconds) but actual different
+    times. Examples observed in this corpus:
+      - One page reported '2026-05-04 08:43:19+00:00' one week,
+        '2026-04-05 07:34:37.171000+00:00' the next (month earlier).
+      - Another: '2026-02-04 05:48:52+00:00' vs '2026-02-04 05:13:04.440000+00:00'
+        (35 min earlier on the same day).
+    The fingerprint is the microseconds split — modern Graph response format
+    includes them, older saved values don't. The dates themselves can diverge
+    by minutes to weeks. Affects ~75% of pages in our corpus across every
+    notebook (not a single-section / duplicate-title issue).
+    A strict string compare here flagged 961/1286 pages as needing refetch
+    on every sync — see history around commit c4e41ff.
+    """
     if not expected_modified or not page_id:
         return None
     p = _content_path(page_id)
     meta = p.with_suffix('.meta')
-    if p.exists() and meta.exists() and meta.read_text().strip() == expected_modified.strip():
+    if not (p.exists() and meta.exists()):
+        return None
+    meta_lm = meta.read_text().strip()
+    expected = expected_modified.strip()
+    if meta_lm == expected:
+        return p.read_text()
+    m, e = _parse_lm(meta_lm), _parse_lm(expected)
+    if m is not None and e is not None and m >= e:
         return p.read_text()
     return None
 
