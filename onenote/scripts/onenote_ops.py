@@ -44,7 +44,7 @@ from onenote_embeddings import (  # noqa: F401
 from onenote_media import (  # noqa: F401
     parse_resources, fetch_resource, download_resources_for_page,
     load_resource, is_cached, PAGE_RESOURCES_DIR,
-    ocr_image, transcribe_resource, process_derived_artifacts, gc_media,
+    ocr_image, transcribe_resource, process_derived_artifacts,
     render_hydrated_html, save_hydrated_html, PAGE_RENDERED_DIR,
 )
 
@@ -367,7 +367,7 @@ async def main_async(args):
     # fetch-media --status/--unstick are diagnostic only; they also skip the
     # client to avoid triggering auth when the user just wants to check/clear
     # a stuck lock.
-    skip_client = (args.cmd in ('read-page', 'read-page-html', 'gc-media',
+    skip_client = (args.cmd in ('read-page', 'read-page-html',
                                  'render-page', 'query', 'query-by-page',
                                  'get-chunk', 'search-title', 'search-content')
                    or (args.cmd == 'fetch-media'
@@ -495,18 +495,6 @@ async def main_async(args):
             for miss in summary['missing']:
                 print(f'       missing: {miss["kind"]:6s} {miss["filename"]}')
 
-    elif args.cmd == 'gc-media':
-        result = gc_media(dry_run=args.dry_run)
-        suffix = ' (DRY RUN)' if result['dry_run'] else ''
-        print(f"gc-media{suffix}: {len(result['deleted'])} orphaned file(s), "
-              f"{result['kept']} kept, "
-              f"{result['orphaned_bytes'] / 1024:.1f} KB reclaimable")
-        for d in result['deleted'][:20]:
-            print(f"  {'would delete' if result['dry_run'] else 'deleted'}: "
-                  f"{Path(d['path']).name}  ({d['size_bytes']} B)")
-        if len(result['deleted']) > 20:
-            print(f"  ... and {len(result['deleted']) - 20} more")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='OneNote CLI')
@@ -575,11 +563,6 @@ if __name__ == '__main__':
                    help='Page identifiers: page_id or "Notebook / Section / Title"')
     p.add_argument('--pages-file', metavar='PATH',
                    help='File with one page identifier per line (# lines ignored)')
-
-    p = sub.add_parser('gc-media',
-                       help='Delete raw resource bytes no longer referenced by any cached page')
-    p.add_argument('--dry-run', action='store_true',
-                   help='Report what would be deleted without deleting')
 
     def _add_search_flags(sp):
         sp.add_argument('--top-k', type=int, default=10, dest='top_k',

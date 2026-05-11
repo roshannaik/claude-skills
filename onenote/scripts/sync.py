@@ -26,6 +26,7 @@ Subcommands:
   sync.py status [-v|--verbose]               report idle / running state +
                                               cache size breakdown
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
+  sync.py gc [--dry-run]                      delete orphaned media files
 """
 import argparse
 import asyncio
@@ -47,6 +48,7 @@ from onenote_cache import (
     REFS_DIR, _content_path, _load_cache, load_content_cache, atomic_write,
 )
 from onenote_lock import duration_limit, DurationExceeded as SyncTimeout
+from onenote_media import gc_media
 
 LOCK_FILE      = REFS_DIR / '.sync.lock'
 HEARTBEAT_FILE = REFS_DIR / '.sync.heartbeat'
@@ -892,6 +894,21 @@ def cmd_unstick(args) -> int:
     return 0
 
 
+def cmd_gc(args) -> int:
+    """Garbage collect orphaned media files no longer referenced by any page."""
+    result = gc_media(dry_run=args.dry_run)
+    suffix = ' (DRY RUN)' if result['dry_run'] else ''
+    print(f"\ngc-media{suffix}: {len(result['deleted'])} orphaned file(s), "
+          f"{result['kept']} kept, "
+          f"{result['orphaned_bytes'] / (1024 * 1024):.1f} MB reclaimable")
+    for d in result['deleted'][:10]:
+        action = 'would delete' if result['dry_run'] else 'deleted'
+        print(f"  {action}: {Path(d['path']).name}  ({d['size_bytes'] / (1024*1024):.1f} MB)")
+    if len(result['deleted']) > 10:
+        print(f"  ... and {len(result['deleted']) - 10} more")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -927,6 +944,10 @@ def main() -> int:
                               help='show media footprint by notebook')
     sub.add_parser('unstick', help='kill hung sync and clean up files')
 
+    gc_parser = sub.add_parser('gc', help='garbage collect orphaned media files')
+    gc_parser.add_argument('--dry-run', action='store_true',
+                          help='report what would be deleted without deleting')
+
     args = ap.parse_args()
     if not args.cmd:
         args.cmd = 'sync'
@@ -934,6 +955,7 @@ def main() -> int:
         'sync':    cmd_sync,
         'status':  cmd_status,
         'unstick': cmd_unstick,
+        'gc':      cmd_gc,
     }[args.cmd](args)
 
 
