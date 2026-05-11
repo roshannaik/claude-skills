@@ -23,7 +23,7 @@ One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 Subcommands:
   sync.py [sync] [--force-embed] [--quiet] [--silent] [--max-duration N]
                  [--max-changes N] [--force]
-  sync.py status                              report idle / running state +
+  sync.py status [-v|--verbose]               report idle / running state +
                                               cache size breakdown
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
 """
@@ -668,7 +668,7 @@ def cmd_status(args) -> int:
                 print(f"  beat     {int(age)}s ago")
             except Exception:
                 pass
-        _print_cache_sizes()
+        _print_cache_sizes(verbose=args.verbose)
         return 0
 
     if STATE_FILE.exists():
@@ -706,17 +706,20 @@ def cmd_status(args) -> int:
                         _print_change_block(ok_summary)  # clean by definition → no errors
                 except Exception:
                     pass
-            _print_cache_sizes()
+            _print_cache_sizes(verbose=args.verbose)
             return 0
         except Exception:
             pass
     print("[Current Status: idle]\nno prior sync recorded")
-    _print_cache_sizes()
+    _print_cache_sizes(verbose=args.verbose)
     return 0
 
 
-def _print_cache_sizes() -> None:
-    """Print per-region size breakdown of the local cache."""
+def _print_cache_sizes(verbose: bool = False) -> None:
+    """Print per-region size breakdown of the local cache (only if verbose)."""
+    if not verbose:
+        return
+
     def _scan(paths) -> tuple[int, int]:
         size = total = 0
         for p in paths:
@@ -772,6 +775,79 @@ def _print_cache_sizes() -> None:
         print(f"  {label:<17} {_fmt_size(size):>10}   ({n:>5} files)")
     print(f"  {'─' * 17} {'─' * 10}   {'─' * 13}")
     print(f"  {'total':<17} {_fmt_size(total_bytes):>10}   ({total_files:>5} files)")
+
+    _print_media_footprint()
+
+
+def _print_media_footprint() -> None:
+    """Print media footprint breakdown by notebook."""
+    from collections import defaultdict
+
+    page_sizes = defaultdict(int)
+    cache_dir = REFS_DIR / 'page_resources'
+    if not cache_dir.exists():
+        return
+
+    for meta_file in cache_dir.glob("*.meta.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            size_bytes = meta.get("size_bytes", 0)
+            for page_id in meta.get("page_ids", []):
+                page_sizes[page_id] += size_bytes
+        except Exception:
+            pass
+
+    if not page_sizes:
+        return
+
+    # Load page_index to map page_ids to notebook/section/title
+    page_index = {}
+    index_file = REFS_DIR / 'page_index.txt'
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if len(parts) == 4:
+                        title, notebook, section, page_id = parts
+                        page_index[page_id] = {
+                            "title": title,
+                            "notebook": notebook,
+                            "section": section
+                        }
+        except Exception:
+            pass
+
+    # Sort by size
+    sorted_pages = sorted(page_sizes.items(), key=lambda x: x[1], reverse=True)
+
+    if not sorted_pages:
+        return
+
+    print(f"\n[Media Footprint by Notebook: top 10 pages]")
+    print(f"| {'Notebook':<18} | {'Section / Page':<50} | {'Size':<14} |")
+    print(f"|{'-' * 20}|{'-' * 52}|{'-' * 16}|")
+
+    shown = 0
+    for idx, (page_id, total_size) in enumerate(sorted_pages):
+        if shown >= 10:
+            break
+        info = page_index.get(page_id)
+        if not info:
+            continue
+        nb = info.get("notebook", "")[:18]
+        sec = info.get("section", "")
+        title = info.get("title", "")
+        section_page = f"{sec} / {title}"[:50]
+
+        size_str = _fmt_size(total_size)
+        emoji = " 🔥" if shown < 2 else ""
+        print(f"| {nb:<18} | {section_page:<50} | {size_str:>10}{emoji:<4} |")
+        shown += 1
+
+    total_media = sum(s for _, s in sorted_pages)
+    print(f"|{'-' * 20}|{'-' * 52}|{'-' * 16}|")
+    print(f"| {'TOTAL':<18} | {'':<50} | {_fmt_size(total_media):>10}     |")
 
 
 def cmd_unstick(args) -> int:
@@ -846,7 +922,9 @@ def main() -> int:
     ps.add_argument('--force', '-f', action='store_true',
                     help='bypass --max-changes threshold')
 
-    sub.add_parser('status',  help='report idle / running state, plus cache sizes')
+    status_parser = sub.add_parser('status',  help='report idle / running state, plus cache sizes')
+    status_parser.add_argument('-v', '--verbose', action='store_true',
+                              help='show media footprint by notebook')
     sub.add_parser('unstick', help='kill hung sync and clean up files')
 
     args = ap.parse_args()
