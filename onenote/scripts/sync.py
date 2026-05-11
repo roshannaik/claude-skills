@@ -23,7 +23,8 @@ One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 Subcommands:
   sync.py [sync] [--force-embed] [--quiet] [--silent] [--max-duration N]
                  [--max-changes N] [--force]
-  sync.py status                              report idle / running state
+  sync.py status                              report idle / running state +
+                                              cache size breakdown
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
 """
 import argparse
@@ -31,6 +32,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -49,6 +51,7 @@ from onenote_lock import duration_limit, DurationExceeded as SyncTimeout
 LOCK_FILE      = REFS_DIR / '.sync.lock'
 HEARTBEAT_FILE = REFS_DIR / '.sync.heartbeat'
 STATE_FILE     = REFS_DIR / '.sync.state.json'
+LAST_OK_FILE   = REFS_DIR / '.sync.last_ok.json'
 LOG_FILE       = REFS_DIR / 'sync.log'
 
 HEARTBEAT_INTERVAL  = 5.0
@@ -63,6 +66,151 @@ class ThresholdExceeded(Exception):
         self.count = count
         self.limit = limit
         super().__init__(f'{step}: {count} pages exceeds threshold {limit}')
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_size(b: int) -> str:
+    if b < 1024:
+        return f'{b} B'
+    n = float(b)
+    for unit in ('KB', 'MB', 'GB', 'TB'):
+        n /= 1024
+        if n < 1024:
+            return f'{n:.1f} {unit}'
+    return f'{n:.1f} PB'
+
+
+def _fmt_elapsed(sec) -> str:
+    try:
+        sec = int(float(sec))
+    except (TypeError, ValueError):
+        return str(sec)
+    if sec < 60:
+        return f'{sec}s'
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f'{m}m {s}s'
+    h, m = divmod(m, 60)
+    return f'{h}h {m}m'
+
+
+def _to_local(iso_ts: str) -> str:
+    """UTC ISO timestamp → local-timezone formatted string. Pass-through on error."""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt.astimezone().strftime('%b %d %Y %I:%M:%S %p %Z')
+                  .replace(' AM ', ' am ').replace(' PM ', ' pm '))
+    except Exception:
+        return iso_ts or '?'
+
+
+def _normalize_error(s: str) -> str:
+    """Collapse multi-line, whitespace-heavy error strings to a single line."""
+    return ' '.join((s or '').split())
+
+
+def _format_error(s: str) -> str:
+    """Render a Graph/MSAL/generic error as `Error: <msg>, Code: <code>`.
+
+    Parses the inner `message='...'` (preferred; carries the human-readable
+    text from the MainError block) and the top-level `Code: NNN` (HTTP code).
+    Falls back to whitespace-normalised raw string when neither pattern is
+    present (non-ODataError exceptions).
+    """
+    s = _normalize_error(s)
+    msg_match  = re.search(r"message='([^']+)'", s)
+    code_match = re.search(r'\bCode:\s*(\d+)', s)
+    parts = []
+    if msg_match:
+        parts.append(f"Error: {msg_match.group(1)}")
+    if code_match:
+        parts.append(f"Code: {code_match.group(1)}")
+    return ', '.join(parts) if parts else s
+
+
+def _notebook_html_size(nb_name: str) -> int:
+    """Sum of cached .html sizes for all pages in this notebook."""
+    cache = _load_cache()
+    nb = cache.get(nb_name, {})
+    total = 0
+    for sec in nb.get('sections', {}).values():
+        for p in sec.get('pages', []):
+            if not isinstance(p, dict) or not p.get('id'):
+                continue
+            try:
+                total += _content_path(p['id']).with_suffix('.html').stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _state_is_clean(state: dict) -> bool:
+    """A sync state is fully clean if status==ok AND no refresh/fetch errors."""
+    if state.get('status') != 'ok':
+        return False
+    summary = state.get('summary', {}) or {}
+    return not summary.get('refresh_errors') and not summary.get('fetch_errors')
+
+
+def _nothing_changed(result: dict) -> bool:
+    if not result:
+        return False
+    emb = result.get('embeddings', {}) or {}
+    return ((result.get('pages_added', 0) or 0)
+            + (result.get('pages_modified', 0) or 0)
+            + (result.get('pages_deleted', 0) or 0)
+            + (result.get('pages_fetched', 0) or 0)
+            + (result.get('pages_fetch_failed', 0) or 0)
+            + (emb.get('pages_rebuilt', emb.get('rebuilt', 0)) or 0)
+            + (emb.get('chunks_embedded', 0) or 0)) == 0
+
+
+def _print_change_block(result: dict, indent: str = '  ') -> None:
+    """Print the notebooks/pages/fetch/embed block (shared by sync + status)."""
+    emb = result.get('embeddings', {}) or {}
+    pages_rebuilt   = emb.get('pages_rebuilt',   emb.get('rebuilt', 0))
+    chunks_embedded = emb.get('chunks_embedded', 0)
+    chunks_reused   = emb.get('chunks_reused',   emb.get('reused', 0))
+    nb_failed = result.get('notebooks_failed', 0)
+    nb_line = (f"{result.get('notebooks_refreshed','?')} total, "
+               f"{result.get('notebooks_dirty','?')} dirty, "
+               f"{result.get('notebooks_unknown','?')} new")
+    if nb_failed:
+        nb_line += f", {nb_failed} failed"
+    print(f"{indent}notebooks  {nb_line}")
+    print(f"{indent}pages      +{result.get('pages_added','?')} added, "
+          f"~{result.get('pages_modified','?')} modified, -{result.get('pages_deleted','?')} deleted")
+    print(f"{indent}fetch      {result.get('pages_fetched','?')} ok, "
+          f"{result.get('pages_fetch_failed','?')} failed")
+    print(f"{indent}embed      {pages_rebuilt} pages rebuilt, "
+          f"{chunks_embedded} chunks embedded, {chunks_reused} reused")
+    refresh_errors = result.get('refresh_errors', {}) or {}
+    fetch_errors   = result.get('fetch_errors', {}) or {}
+    if refresh_errors or fetch_errors:
+        print(f"{indent}errors:")
+        for nb, err in refresh_errors.items():
+            print(f"{indent}  [refresh] {nb} — {_format_error(err)}")
+        if fetch_errors:
+            # Group by formatted error — rate-limit cascades produce many pages
+            # with identical errors; ungrouped output would be unreadable.
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for label, err in fetch_errors.items():
+                grouped[_format_error(err)].append(label)
+            for err_msg, labels in grouped.items():
+                if len(labels) == 1:
+                    print(f"{indent}  [fetch]   {labels[0]} — {err_msg}")
+                else:
+                    print(f"{indent}  [fetch]   {err_msg} ({len(labels)} pages):")
+                    for label in labels[:5]:
+                        print(f"{indent}              {label}")
+                    if len(labels) > 5:
+                        print(f"{indent}              ... and {len(labels) - 5} more")
 
 # ---------------------------------------------------------------------------
 # Step timing + progress (module-level, updated by _set_step / _set_progress)
@@ -202,11 +350,18 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
             result = nb_name, {'error': str(e)}
         refresh_done[0] += 1
         if verbose:
-            status = '' if 'error' not in result[1] else f'  [error: {result[1]["error"][:50]}]'
-            print(f'  [{refresh_done[0]}/{len(to_refresh)}] {nb_name}{status}', flush=True)
+            info = result[1]
+            if 'error' in info:
+                suffix = f'  [{_format_error(info["error"])}]'
+            else:
+                suffix = (f' — {info.get("pages", "?")} pages, '
+                          f'{info.get("sections", "?")} sections, '
+                          f'{_fmt_size(_notebook_html_size(nb_name))} html')
+            print(f'  [{refresh_done[0]}/{len(to_refresh)}] {nb_name}{suffix}', flush=True)
         return result
 
-    await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
+    refresh_results = await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
+    refresh_errors = {nb: info['error'] for nb, info in refresh_results if 'error' in info}
 
     cache = _load_cache()
     after = _snapshot_pages(cache)
@@ -240,6 +395,7 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         if load_content_cache(pid, after[pid][3]) is None
     }
     fetched = failed = 0
+    fetch_errors: dict = {}
     to_fetch_ids = added_ids | modified_ids | missing_html_ids
 
     if not force and max_changes > 0 and len(to_fetch_ids) > max_changes:
@@ -267,9 +423,11 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
                   'label': f'{after[pid][0]} / {after[pid][1]} / {after[pid][2]}'}
                  for pid in to_fetch_ids]
         results = await fetch_pages_by_id(client, items, on_progress=_on_page_done)
+        label_by_id = {it['page_id']: it['label'] for it in items}
         for r in results:
             if 'error' in r:
                 failed += 1
+                fetch_errors[label_by_id.get(r['id'], r['id'])] = r['error']
             else:
                 fetched += 1
 
@@ -294,11 +452,14 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         'notebooks_refreshed': len(to_refresh),
         'notebooks_dirty':    len(dirty),
         'notebooks_unknown':  len(unknown),
+        'notebooks_failed':   len(refresh_errors),
         'pages_added':        len(added_ids),
         'pages_modified':     len(modified_ids),
         'pages_deleted':      len(deleted_ids),
         'pages_fetched':      fetched,
         'pages_fetch_failed': failed,
+        'refresh_errors':     refresh_errors,
+        'fetch_errors':       fetch_errors,
         'embeddings':         embed_result,
     }
 
@@ -381,6 +542,8 @@ def cmd_sync(args) -> int:
         raise
 
     atomic_write(STATE_FILE, json.dumps(state, indent=2))
+    if _state_is_clean(state):
+        atomic_write(LAST_OK_FILE, json.dumps(state, indent=2))
 
     # One-line JSONL row — flat keys for easy grep/jq.
     log_row = {
@@ -423,18 +586,17 @@ def cmd_sync(args) -> int:
               file=sys.stderr)
         return 4
 
-    nothing_changed = (result['pages_added'] + result['pages_modified']
-                       + result['pages_deleted'] == 0)
-    if args.quiet and nothing_changed:
+    nothing_changed = _nothing_changed(result)
+    has_errors = bool(result.get('refresh_errors') or result.get('fetch_errors'))
+    if args.quiet and nothing_changed and not has_errors:
         return 0
 
-    print(
-        f"sync done in {state['elapsed_sec']}s: "
-        f"nb refreshed={result['notebooks_refreshed']} (dirty={result['notebooks_dirty']} new={result['notebooks_unknown']}), "
-        f"pages +{result['pages_added']} ~{result['pages_modified']} -{result['pages_deleted']}, "
-        f"fetched={result['pages_fetched']} failed={result['pages_fetch_failed']}, "
-        f"embed pages_rebuilt={result['embeddings'].get('pages_rebuilt', result['embeddings'].get('rebuilt', 0))} chunks_embedded={result['embeddings'].get('chunks_embedded', 0)} chunks_reused={result['embeddings'].get('chunks_reused', result['embeddings'].get('reused', 0))}"
-    )
+    elapsed = _fmt_elapsed(state['elapsed_sec'])
+    if nothing_changed and not has_errors:
+        print(f"sync done in {elapsed} — no changes ({result['notebooks_refreshed']} notebooks)")
+    else:
+        print(f"sync done in {elapsed}")
+        _print_change_block(result)
     return 0
 
 
@@ -477,57 +639,139 @@ def cmd_status(args) -> int:
         hb   = _read_heartbeat()
         pid  = body.get('pid') or hb.get('pid', '?')
         step = hb.get('step', 'starting')
-        started = body.get('started_at', '?')
+        started = body.get('started_at', '')
         now = datetime.now(timezone.utc)
 
-        elapsed_s = ''
-        try:
-            elapsed = (now - datetime.fromisoformat(started)).total_seconds()
-            elapsed_s = f", elapsed {int(elapsed)}s"
-        except Exception:
-            pass
-
-        step_s = ''
-        try:
-            step_elapsed = (now - datetime.fromisoformat(hb['step_started_at'])).total_seconds()
-            step_s = f" (step {int(step_elapsed)}s"
-            prog = hb.get('progress', {})
-            if prog:
-                step_s += f", {prog['done']}/{prog['total']}"
-            step_s += ')'
-        except Exception:
-            pass
-
-        beat_s = ''
-        if hb:
+        print(f"[Current Status: running] pid {pid}")
+        if started:
+            print(f"  started  {_to_local(started)}")
             try:
-                age = (now - datetime.fromisoformat(hb.get('ts', ''))).total_seconds()
-                beat_s = f", last beat {int(age)}s ago"
+                elapsed = (now - datetime.fromisoformat(started)).total_seconds()
+                print(f"  elapsed  {_fmt_elapsed(elapsed)}")
             except Exception:
                 pass
 
-        print(f"running  pid={pid}  step={step}{step_s}{elapsed_s}{beat_s}")
+        step_line = f"  step     {step}"
+        try:
+            step_elapsed = (now - datetime.fromisoformat(hb['step_started_at'])).total_seconds()
+            step_line += f" — {_fmt_elapsed(step_elapsed)}"
+            prog = hb.get('progress', {})
+            if prog:
+                step_line += f", {prog['done']}/{prog['total']}"
+        except Exception:
+            pass
+        print(step_line)
+
+        if hb:
+            try:
+                age = (now - datetime.fromisoformat(hb.get('ts', ''))).total_seconds()
+                print(f"  beat     {int(age)}s ago")
+            except Exception:
+                pass
+        _print_cache_sizes()
         return 0
 
     if STATE_FILE.exists():
         try:
             st = json.loads(STATE_FILE.read_text())
-            if st.get('status') == 'ok':
-                s = st.get('summary', {})
-                print(f"idle  last sync: {st.get('finished_at','?')}  "
-                      f"({st.get('elapsed_sec','?')}s, "
-                      f"pages +{s.get('pages_added','?')} "
-                      f"~{s.get('pages_modified','?')} "
-                      f"-{s.get('pages_deleted','?')}, "
-                      f"embed pages_rebuilt={s.get('embeddings',{}).get('pages_rebuilt', s.get('embeddings',{}).get('rebuilt','?'))})")
+            status = st.get('status', '?')
+            label = {'ok': 'OK', 'timeout': 'TIMED OUT',
+                     'aborted': 'ABORTED', 'failed': 'FAILED'}.get(status, status.upper())
+            finished = st.get('finished_at', '')
+            elapsed  = _fmt_elapsed(st.get('elapsed_sec', '?'))
+            print("[Current Status: idle]")
+            print(f"[Last Sync: {label}] {_to_local(finished)} ({elapsed})")
+
+            if status == 'ok':
+                s = st.get('summary', {}) or {}
+                if _nothing_changed(s) and not s.get('refresh_errors') and not s.get('fetch_errors'):
+                    print(f"  no changes ({s.get('notebooks_refreshed','?')} notebooks)")
+                else:
+                    _print_change_block(s)
             else:
-                print(f"idle  last sync FAILED @ {st.get('finished_at','?')}: "
-                      f"{st.get('error','?')}")
+                print(f"  error   {st.get('error','?')}")
+
+            # When the latest sync isn't fully clean, surface when the last
+            # fully-clean one happened so it's clear how stale the cache is.
+            if not _state_is_clean(st) and LAST_OK_FILE.exists():
+                try:
+                    ok = json.loads(LAST_OK_FILE.read_text())
+                    ok_finished = _to_local(ok.get('finished_at', ''))
+                    ok_elapsed  = _fmt_elapsed(ok.get('elapsed_sec', '?'))
+                    print(f"\n[Last Clean Sync: OK] {ok_finished} ({ok_elapsed})")
+                    ok_summary = ok.get('summary', {}) or {}
+                    if _nothing_changed(ok_summary):
+                        print(f"  no changes ({ok_summary.get('notebooks_refreshed','?')} notebooks)")
+                    else:
+                        _print_change_block(ok_summary)  # clean by definition → no errors
+                except Exception:
+                    pass
+            _print_cache_sizes()
             return 0
         except Exception:
             pass
-    print("idle  (no prior sync recorded)")
+    print("[Current Status: idle]\nno prior sync recorded")
+    _print_cache_sizes()
     return 0
+
+
+def _print_cache_sizes() -> None:
+    """Print per-region size breakdown of the local cache."""
+    def _scan(paths) -> tuple[int, int]:
+        size = total = 0
+        for p in paths:
+            try:
+                if p.is_file():
+                    size += p.stat().st_size
+                    total += 1
+            except OSError:
+                pass
+        return size, total
+
+    pc_files = list((REFS_DIR / 'page_content').glob('*')) \
+        if (REFS_DIR / 'page_content').exists() else []
+    pr_files = list((REFS_DIR / 'page_resources').glob('*')) \
+        if (REFS_DIR / 'page_resources').exists() else []
+    pr_files = [p for p in pr_files if p.is_file()]
+
+    derived_suf = ('.ocr.txt', '.caption.txt', '.transcript.txt')
+    derived  = [p for p in pr_files if p.name.endswith(derived_suf)]
+    pr_meta  = [p for p in pr_files if p.name.endswith('.meta.json')]
+    raw_set  = set(derived) | set(pr_meta)
+    raw      = [p for p in pr_files if p not in raw_set]
+
+    rendered = list((REFS_DIR / 'page_rendered').glob('*')) \
+        if (REFS_DIR / 'page_rendered').exists() else []
+    embeddings = [p for p in (REFS_DIR / 'embeddings.npz',
+                              REFS_DIR / 'embeddings_meta.json') if p.exists()]
+    index = [p for p in (REFS_DIR / 'onenote_cache.json',
+                         REFS_DIR / 'page_index.txt',
+                         REFS_DIR / 'page_subjects.json',
+                         REFS_DIR / 'subject_overrides.json') if p.exists()]
+    sync_state = list(REFS_DIR.glob('.sync.*'))
+    if (REFS_DIR / 'sync.log').exists():
+        sync_state.append(REFS_DIR / 'sync.log')
+
+    sections = [
+        ('html pages',      pc_files),
+        ('media (raw)',     raw),
+        ('media (derived)', derived),
+        ('media (meta)',    pr_meta),
+        ('page rendered',   rendered),
+        ('embeddings',      embeddings),
+        ('index',           index),
+        ('sync state',      sync_state),
+    ]
+
+    print(f"\n[Cache: {REFS_DIR}]")
+    total_bytes = total_files = 0
+    for label, paths in sections:
+        size, n = _scan(paths)
+        total_bytes += size
+        total_files += n
+        print(f"  {label:<17} {_fmt_size(size):>10}   ({n:>5} files)")
+    print(f"  {'─' * 17} {'─' * 10}   {'─' * 13}")
+    print(f"  {'total':<17} {_fmt_size(total_bytes):>10}   ({total_files:>5} files)")
 
 
 def cmd_unstick(args) -> int:
@@ -602,7 +846,7 @@ def main() -> int:
     ps.add_argument('--force', '-f', action='store_true',
                     help='bypass --max-changes threshold')
 
-    sub.add_parser('status',  help='report idle / running state')
+    sub.add_parser('status',  help='report idle / running state, plus cache sizes')
     sub.add_parser('unstick', help='kill hung sync and clean up files')
 
     args = ap.parse_args()

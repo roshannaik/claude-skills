@@ -308,7 +308,7 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
                       and c.kind not in ('image', 'pdf', 'audio'))]
 
     carry_count = len(all_chunks) - len(need_embed)
-    print(f'Pages targeted: {len(target_pids)}; '
+    print(f'  total pages: {len(target_pids)}; '
           f'{len(pages_to_rebuild)} to rebuild; '
           f'{len(all_chunks)} total chunks; '
           f'{len(need_embed)} to embed, {carry_count} reusable',
