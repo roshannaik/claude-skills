@@ -22,6 +22,7 @@ One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 
 Subcommands:
   sync.py [sync] [--force-embed] [--quiet] [--silent] [--max-duration N]
+                 [--max-changes N] [--force]
   sync.py status                              report idle / running state
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
 """
@@ -52,6 +53,16 @@ LOG_FILE       = REFS_DIR / 'sync.log'
 
 HEARTBEAT_INTERVAL  = 5.0
 DEFAULT_MAX_SECONDS = 600
+DEFAULT_MAX_CHANGES = 20    # abort if fetch or embed would touch more pages
+
+
+class ThresholdExceeded(Exception):
+    """Raised when a sync step would update more pages than --max-changes allows."""
+    def __init__(self, step: str, count: int, limit: int):
+        self.step  = step
+        self.count = count
+        self.limit = limit
+        super().__init__(f'{step}: {count} pages exceeds threshold {limit}')
 
 # ---------------------------------------------------------------------------
 # Step timing + progress (module-level, updated by _set_step / _set_progress)
@@ -155,7 +166,8 @@ def _snapshot_pages(cache: dict) -> dict:
 # Main sync flow
 # ---------------------------------------------------------------------------
 
-async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
+async def _sync_async(force_embed: bool, verbose: bool = False,
+                      max_changes: int = 0, force: bool = False) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
     from onenote_api import refresh_notebook, fetch_pages_by_id
 
@@ -229,6 +241,10 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
     }
     fetched = failed = 0
     to_fetch_ids = added_ids | modified_ids | missing_html_ids
+
+    if not force and max_changes > 0 and len(to_fetch_ids) > max_changes:
+        raise ThresholdExceeded('fetch', len(to_fetch_ids), max_changes)
+
     if to_fetch_ids:
         _set_step(f'fetching {len(to_fetch_ids)} new/modified page(s)')
         total_fetch = len(to_fetch_ids)
@@ -264,8 +280,13 @@ async def _sync_async(force_embed: bool, verbose: bool = False) -> dict:
     def _on_page_embedded(nb, sec, title, n_chunks, page_num, total_pages):
         print(f'  [page {page_num}/{total_pages}] {nb} / {sec} / {title} — {n_chunks} chunks', flush=True)
 
-    embed_result = build_embeddings(force=force_embed, deleted_page_ids=deleted_ids,
-                                    on_page_embedded=_on_page_embedded if verbose else None)
+    embed_result = build_embeddings(
+        force=force_embed, deleted_page_ids=deleted_ids,
+        on_page_embedded=_on_page_embedded if verbose else None,
+        max_rebuilds=0 if (force or force_embed) else max_changes,
+    )
+    if embed_result.get('aborted'):
+        raise ThresholdExceeded('embed', embed_result['pages_to_rebuild'], max_changes)
 
     _set_step(None)  # finalize the last step's "done (Xs)" line
 
@@ -318,12 +339,23 @@ def cmd_sync(args) -> int:
 
     try:
         with duration_limit(args.max_duration, 'sync'):
-            result = asyncio.run(_sync_async(force_embed=args.force_embed, verbose=args.verbose))
+            result = asyncio.run(_sync_async(
+                force_embed=args.force_embed, verbose=args.verbose,
+                max_changes=args.max_changes, force=args.force,
+            ))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'elapsed_sec': round(time.perf_counter() - t0, 1),
             'summary':     result,
         })
+    except ThresholdExceeded as e:
+        state = {
+            'status':      'aborted',
+            'started_at':  started_at,
+            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'elapsed_sec': round(time.perf_counter() - t0, 1),
+            'error':       f'ThresholdExceeded: {e}',
+        }
     except SyncTimeout as e:
         state = {
             'status':      'timeout',
@@ -383,6 +415,13 @@ def cmd_sync(args) -> int:
         print(f"sync TIMED OUT after {state['elapsed_sec']}s: {state['error']}",
               file=sys.stderr)
         return 3
+
+    if state['status'] == 'aborted':
+        print(f"sync ABORTED after {state['elapsed_sec']}s: {state['error']}",
+              file=sys.stderr)
+        print(f"  re-run with --force or raise --max-changes <N> to proceed",
+              file=sys.stderr)
+        return 4
 
     nothing_changed = (result['pages_added'] + result['pages_modified']
                        + result['pages_deleted'] == 0)
@@ -543,7 +582,8 @@ def main() -> int:
     # for sync-only flags so we don't need a per-flag fallback when no
     # subcommand is given.
     ap.set_defaults(cmd='sync', force_embed=False, quiet=False, verbose=True,
-                    max_duration=DEFAULT_MAX_SECONDS)
+                    max_duration=DEFAULT_MAX_SECONDS,
+                    max_changes=DEFAULT_MAX_CHANGES, force=False)
     sub = ap.add_subparsers(dest='cmd')
 
     ps = sub.add_parser('sync', help='sync now (default if no subcommand)')
@@ -555,6 +595,12 @@ def main() -> int:
                     help='suppress per-page progress (summary line only)')
     ps.add_argument('--max-duration', type=int, default=DEFAULT_MAX_SECONDS,
                     help=f'seconds before SIGALRM self-kill (default {DEFAULT_MAX_SECONDS}, 0 disables)')
+    ps.add_argument('--max-changes', type=int, default=DEFAULT_MAX_CHANGES,
+                    help=f'abort if fetch or embed would touch more pages than this '
+                         f'(default {DEFAULT_MAX_CHANGES}, 0 disables). '
+                         f'Guards against runaway rebuilds from Graph last_modified flutter.')
+    ps.add_argument('--force', '-f', action='store_true',
+                    help='bypass --max-changes threshold')
 
     sub.add_parser('status',  help='report idle / running state')
     sub.add_parser('unstick', help='kill hung sync and clean up files')

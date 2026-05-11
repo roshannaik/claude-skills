@@ -38,6 +38,7 @@ python3 scripts/build_embeddings.py --force          # full rebuild (after model
 # Keep cache fresh in one shot (detects dirty notebooks via last_modified; re-embeds the delta)
 python3 scripts/sync.py                      # sync with per-page progress (default)
 python3 scripts/sync.py sync --silent        # summary only, no per-page output
+python3 scripts/sync.py sync --force         # bypass --max-changes safety threshold
 python3 scripts/sync.py status               # idle | running (reports pid + start time)
 python3 scripts/sync.py unstick              # kill a hung sync
 ```
@@ -65,7 +66,7 @@ All modules live in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`
 | `classify_subjects.py` | One-off (+ incremental) per-page subject classifier (`self` / `general` / `<Person>`). Writes `cache/page_subjects.json`; `cache/subject_overrides.json` patches it at query time. |
 | `build_embeddings.py` | Standalone CLI wrapper for `onenote_embeddings.build_embeddings`. Used by `sync.py` and for manual rebuilds. |
 | `cache_backup.py` | Backup (`backup`) and restore (`restore --yes`) the entire `cache/` to/from OneDrive root (`onenote_cache.tar.gz`) via Graph Drive API. Uses the same auth as the rest of the skill. |
-| `sync.py` | Single-shot cache sync orchestrator. Detects dirty notebooks via `last_modified`, refreshes them, prunes orphans, triggers incremental embedding rebuild. fcntl-locked + self-kill via SIGALRM after `--max-duration`; JSONL log at `cache/sync.log`. Designed to be safe to fire from cron / launchd / keystroke. |
+| `sync.py` | Single-shot cache sync orchestrator. Detects dirty notebooks via `last_modified`, refreshes them, prunes orphans, triggers incremental embedding rebuild. fcntl-locked + self-kill via SIGALRM after `--max-duration`; JSONL log at `cache/sync.log`. `--max-changes N` (default 20) aborts the run if either the fetch step or the embed step would touch more than N pages — runaway-rebuild guard against Graph `lastModifiedDateTime` flutter regressions; `--force` bypasses. Designed to be safe to fire from cron / launchd / keystroke. |
 
 ### Cache layout (`cache/`, gitignored)
 

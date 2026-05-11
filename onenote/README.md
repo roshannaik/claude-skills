@@ -140,9 +140,12 @@ Newly shared notebooks need to be opened at least once in OneNote (web, desktop,
 ```bash
 python3 $SKILL_ROOT/onenote/scripts/sync.py                  # sync now (per-page progress by default)
 python3 $SKILL_ROOT/onenote/scripts/sync.py sync --silent    # summary line only, no per-page output
+python3 $SKILL_ROOT/onenote/scripts/sync.py sync --force     # bypass --max-changes threshold
 python3 $SKILL_ROOT/onenote/scripts/sync.py status           # idle / running (shows step elapsed + done/total)
 python3 $SKILL_ROOT/onenote/scripts/sync.py unstick          # kill a hung sync
 ```
+
+A sync aborts (exit 4) if it would fetch or embed more than 20 pages — guards against runaway rebuilds from Graph `last_modified` flutter. Override with `--max-changes N` (`0` to disable) or `--force` to bypass.
 
 Only one sync runs at a time (enforced by `fcntl.flock`), so it's safe to invoke from any harness, cron, launchd, or a keystroke. The kernel releases the lock when the process dies — stale lockfiles can't block future runs.
 

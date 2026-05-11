@@ -204,12 +204,16 @@ def _resolve_page_ids(page_ids: list, pages_file: str) -> list:
 def build_embeddings(page_ids: list = None, pages_file: str = None,
                      force: bool = False,
                      deleted_page_ids: set = None,
-                     on_page_embedded=None) -> dict:
+                     on_page_embedded=None,
+                     max_rebuilds: int = 0) -> dict:
     """(Re)build the embedding store for a subset of pages.
 
     Args:
         page_ids / pages_file: subset of pages. If both None, ALL cached pages.
         force: ignore last_modified and re-embed every chunk.
+        max_rebuilds: if > 0 and len(pages_to_rebuild) > max_rebuilds, return
+            early with {'aborted': True, ...} instead of running embeds.
+            Guard against runaway rebuilds from Graph flutter regressions.
 
     Returns summary dict.
     """
@@ -278,6 +282,19 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         }
         for c in chunks:
             all_chunks.append((c, pid, page_meta))
+
+    # Runaway-rebuild guard: abort before any Gemini calls if the caller set a
+    # threshold and we'd exceed it. Real edit days touch a handful of pages;
+    # a sudden 100+ usually means a regression in carry-forward (e.g. Graph
+    # last_modified flutter) and not actual edits.
+    if max_rebuilds > 0 and len(pages_to_rebuild) > max_rebuilds:
+        return {
+            'aborted':          True,
+            'reason':           'max_rebuilds threshold exceeded',
+            'pages_to_rebuild': len(pages_to_rebuild),
+            'max_rebuilds':     max_rebuilds,
+            'pages_targeted':   len(target_pids),
+        }
 
     # Chunks we need to embed. For pages being rebuilt, always re-embed text and
     # summary chunks — their IDs are position-based so stale vectors may survive
