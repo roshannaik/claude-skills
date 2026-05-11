@@ -146,6 +146,23 @@ python3 $SKILL_ROOT/onenote/scripts/sync.py unstick          # kill a hung sync
 
 Only one sync runs at a time (enforced by `fcntl.flock`), so it's safe to invoke from any harness, cron, launchd, or a keystroke. The kernel releases the lock when the process dies — stale lockfiles can't block future runs.
 
+### Backup and restore cache to OneDrive
+
+The cache (embeddings, HTML snapshots, media) can be archived to OneDrive and restored on another machine. Each backup overwrites the previous file; OneDrive version history handles rollback.
+
+```bash
+# Push cache to OneDrive (overwrites onenote_cache.tar.gz in your drive root)
+python3 $SKILL_ROOT/onenote/scripts/cache_backup.py backup
+
+# Pull cache from OneDrive (prompts before overwriting local cache/)
+python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore
+
+# Skip the confirmation prompt (e.g. on a fresh machine)
+python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore --yes
+```
+
+Uses the same MS Graph auth as the skill — no separate credential setup needed.
+
 ### Schedule a 3-hour background sync (macOS, launchd)
 
 Install a user launch agent that fires every 3 hours and at login:
