@@ -354,6 +354,14 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
             for pid in deleted_page_ids:
                 merged_pages_meta.pop(pid, None)
 
+        # Defensive: drop pages no longer present in the cache. Self-heals
+        # from any historic drift — interrupted prior runs, page moves that
+        # changed the page_id, or legacy state from before deleted_page_ids
+        # was wired in. Cascades through the live-chunk filter below.
+        cache_pids = set(pid_index.keys())
+        merged_pages_meta = {pid: pm for pid, pm in merged_pages_meta.items()
+                             if pid in cache_pids}
+
         # Filter to live chunk_ids only
         live = set()
         for p in merged_pages_meta.values():

@@ -4,7 +4,8 @@
 Detects changes on the server with a single list_notebooks call, then refreshes
 only dirty notebooks. Prunes orphaned HTML + embedding vectors for deleted
 pages. Pre-fetches content for new/modified pages so the embeddings rebuild
-picks them up.
+picks them up. After embeddings, GCs orphaned media bytes when any page was
+modified or deleted (pure inserts can't drop resource references).
 
 Concurrency: uses fcntl.flock on a lock file. The kernel releases the lock
 when the process dies (crash, SIGKILL, OOM, reboot), so stale locks are
@@ -21,8 +22,8 @@ self-kill, so a sync can never wedge launchd indefinitely.
 One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 
 Subcommands:
-  sync.py [sync] [--force-embed] [--quiet] [--silent] [--max-duration N]
-                 [--max-changes N] [--force]
+  sync.py [sync] [--notebook NAME] [--force-embed] [--quiet]
+                 [--max-duration N] [--max-changes N] [--force]
   sync.py status [-v|--verbose]               report idle / running state +
                                               cache size breakdown
   sync.py unstick                             SIGTERM/SIGKILL a hung sync
@@ -74,15 +75,15 @@ class ThresholdExceeded(Exception):
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_size(b: int) -> str:
+def _fmt_size(b: int, precision: int = 1) -> str:
     if b < 1024:
         return f'{b} B'
     n = float(b)
     for unit in ('KB', 'MB', 'GB', 'TB'):
         n /= 1024
         if n < 1024:
-            return f'{n:.1f} {unit}'
-    return f'{n:.1f} PB'
+            return f'{n:.{precision}f} {unit}'
+    return f'{n:.{precision}f} PB'
 
 
 def _fmt_elapsed(sec) -> str:
@@ -173,24 +174,66 @@ def _nothing_changed(result: dict) -> bool:
 
 
 def _print_change_block(result: dict, indent: str = '  ') -> None:
-    """Print the notebooks/pages/fetch/embed block (shared by sync + status)."""
+    """Print the notebooks/pages/fetch/embed block (shared by sync + status).
+
+    Zero rows are suppressed to keep the log compact. The `notebooks` line
+    always prints because seeing "N total" confirms the run scope.
+    """
     emb = result.get('embeddings', {}) or {}
     pages_rebuilt   = emb.get('pages_rebuilt',   emb.get('rebuilt', 0))
     chunks_embedded = emb.get('chunks_embedded', 0)
     chunks_reused   = emb.get('chunks_reused',   emb.get('reused', 0))
+
+    nb_total  = result.get('notebooks_refreshed', 0)
+    nb_dirty  = result.get('notebooks_dirty', 0)
+    nb_new    = result.get('notebooks_unknown', 0)
     nb_failed = result.get('notebooks_failed', 0)
-    nb_line = (f"{result.get('notebooks_refreshed','?')} total, "
-               f"{result.get('notebooks_dirty','?')} dirty, "
-               f"{result.get('notebooks_unknown','?')} new")
-    if nb_failed:
-        nb_line += f", {nb_failed} failed"
-    print(f"{indent}notebooks  {nb_line}")
-    print(f"{indent}pages      +{result.get('pages_added','?')} added, "
-          f"~{result.get('pages_modified','?')} modified, -{result.get('pages_deleted','?')} deleted")
-    print(f"{indent}fetch      {result.get('pages_fetched','?')} ok, "
-          f"{result.get('pages_fetch_failed','?')} failed")
-    print(f"{indent}embed      {pages_rebuilt} pages rebuilt, "
-          f"{chunks_embedded} chunks embedded, {chunks_reused} reused")
+    nb_parts = [f"{nb_total} total"]
+    if nb_dirty:  nb_parts.append(f"{nb_dirty} dirty")
+    if nb_new:    nb_parts.append(f"{nb_new} new")
+    if nb_failed: nb_parts.append(f"{nb_failed} failed")
+    print(f"{indent}notebooks  {', '.join(nb_parts)}")
+
+    p_added = result.get('pages_added', 0)
+    p_mod   = result.get('pages_modified', 0)
+    p_del   = result.get('pages_deleted', 0)
+    p_parts = []
+    if p_added: p_parts.append(f"+{p_added} added")
+    if p_mod:   p_parts.append(f"~{p_mod} modified")
+    if p_del:   p_parts.append(f"-{p_del} deleted")
+    if p_parts:
+        print(f"{indent}pages      {', '.join(p_parts)}")
+
+    f_ok   = result.get('pages_fetched', 0)
+    f_fail = result.get('pages_fetch_failed', 0)
+    if f_ok or f_fail:
+        f_parts = []
+        if f_ok:   f_parts.append(f"{f_ok} ok")
+        if f_fail: f_parts.append(f"{f_fail} failed")
+        print(f"{indent}fetch      {', '.join(f_parts)}")
+
+    if pages_rebuilt or chunks_embedded:
+        emb_parts = []
+        if pages_rebuilt:
+            emb_parts.append(f"{pages_rebuilt} page{'' if pages_rebuilt == 1 else 's'} rebuilt")
+        if chunks_embedded:
+            emb_parts.append(f"{chunks_embedded} chunks embedded")
+        if chunks_reused:
+            emb_parts.append(f"{chunks_reused} reused")
+        print(f"{indent}embed      {', '.join(emb_parts)}")
+
+    gc = result.get('gc') or {}
+    if gc.get('deleted'):
+        print(f"{indent}gc         {gc['deleted']} file{'' if gc['deleted'] == 1 else 's'} deleted, "
+              f"{_fmt_size(gc['reclaimed_bytes'])} reclaimed")
+
+    sweep = result.get('sweep') or {}
+    sweep_parts = []
+    if sweep.get('content'):  sweep_parts.append(f"{sweep['content']} content")
+    if sweep.get('rendered'): sweep_parts.append(f"{sweep['rendered']} rendered")
+    if sweep.get('subjects'): sweep_parts.append(f"{sweep['subjects']} subjects")
+    if sweep_parts:
+        print(f"{indent}sweep      {', '.join(sweep_parts)} orphan(s)")
     refresh_errors = result.get('refresh_errors', {}) or {}
     fetch_errors   = result.get('fetch_errors', {}) or {}
     if refresh_errors or fetch_errors:
@@ -241,23 +284,29 @@ _current_step: str = ''   # empty = no active step (initial or finalized)
 _stop_heartbeat = threading.Event()
 
 
+def _now_hms() -> str:
+    """Local-time `HH:MM:SS` for log-line prefixes."""
+    return datetime.now().strftime('%H:%M:%S')
+
+
 def _set_step(step: str | None) -> None:
     """Transition to a new step, or finalize the current one.
 
-    Prints `done (Xs)` for the prior step (if any) then `<step> ...` for
-    the new one. Pass None or '' to close out the last step without
-    starting a new one (e.g. at end of sync).
+    Prints `[HH:MM:SS]   done (Xs)` for the prior step (if any) then
+    `[HH:MM:SS] <Step> ...` for the new one. Pass None or '' to close out
+    the last step without starting a new one (e.g. at end of sync).
     """
     global _current_step, _step_t0, _step_started_at_iso, _step_progress
     now_perf = time.perf_counter()
     if _current_step:
-        print(f'  done ({now_perf - _step_t0:.1f}s)', flush=True)
+        print(f'[{_now_hms()}]   done ({now_perf - _step_t0:.1f}s)', flush=True)
     _current_step = step or ''
     _step_t0 = now_perf
     _step_progress = {}
     if step:
         _step_started_at_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        print(f'{step} ...', flush=True)
+        capitalized = step[0].upper() + step[1:]
+        print(f'[{_now_hms()}] {capitalized} ...', flush=True)
         _write_heartbeat()
 
 
@@ -294,6 +343,60 @@ def _clear_heartbeat() -> None:
 # Page snapshot (before / after refresh)
 # ---------------------------------------------------------------------------
 
+def _sweep_orphans(valid_pids: set) -> dict:
+    """Remove per-page artifacts for pages no longer in cache. Self-healing:
+    catches orphans from interrupted prior runs, page moves that re-key the
+    page_id, or legacy state from before delta-based pruning existed.
+
+    Covers: page_content/*.html + *.meta, page_rendered/*.html,
+    page_subjects.json. Resource/media orphans are handled by gc_media.
+    embeddings_meta.json is self-healed inside build_embeddings via its own
+    intersection with the current cache.
+    """
+    valid_safes = {pid.replace('!', '_').replace('/', '_') for pid in valid_pids}
+    counts = {'content': 0, 'rendered': 0, 'subjects': 0}
+
+    pc = REFS_DIR / 'page_content'
+    if pc.exists():
+        for p in pc.iterdir():
+            if not p.is_file():
+                continue
+            safe = p.name.rsplit('.', 1)[0]
+            if safe in valid_safes:
+                continue
+            try:
+                p.unlink()
+                counts['content'] += 1
+            except FileNotFoundError:
+                pass
+
+    rd = REFS_DIR / 'page_rendered'
+    if rd.exists():
+        for p in rd.glob('*.html'):
+            safe = p.name.rsplit('.', 1)[0]
+            if safe in valid_safes:
+                continue
+            try:
+                p.unlink()
+                counts['rendered'] += 1
+            except FileNotFoundError:
+                pass
+
+    subj_path = REFS_DIR / 'page_subjects.json'
+    if subj_path.exists():
+        try:
+            subjects = json.loads(subj_path.read_text())
+            cleaned = {pid: lbl for pid, lbl in subjects.items() if pid in valid_pids}
+            removed = len(subjects) - len(cleaned)
+            if removed:
+                atomic_write(subj_path, json.dumps(cleaned, indent=2))
+                counts['subjects'] = removed
+        except Exception:
+            pass
+
+    return counts
+
+
 def _snapshot_pages(cache: dict) -> dict:
     """Return {page_id: (notebook, section, title, last_modified)} for every cached page."""
     out = {}
@@ -317,50 +420,45 @@ def _snapshot_pages(cache: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _sync_async(force_embed: bool, verbose: bool = False,
-                      max_changes: int = 0, force: bool = False) -> dict:
+                      max_changes: int = 0, force: bool = False,
+                      notebook_name: str | None = None) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
     from onenote_api import refresh_notebook, fetch_pages_by_id
 
     client = make_graph_client()
 
-    _set_step('listing notebooks')
+    _set_step('listing notebooks')  # capitalization handled by _set_step
     fresh_nbs = await list_notebooks(client)
 
     cache = _load_cache()
-    dirty, unknown = [], []
-    for nb in fresh_nbs:
-        cached = cache.get(nb['name'])
-        if not cached or not cached.get('id'):
-            unknown.append(nb['name'])
-        elif cached.get('last_modified', '') != nb['last_modified']:
-            dirty.append(nb['name'])
+    # "unknown" = brand-new notebooks not yet in cache (independent of LM).
+    # We deliberately do NOT compute notebook-dirty from notebook-level
+    # last_modified — Graph's notebook lastModifiedDateTime is broken: it is
+    # frozen at creation for older notebooks (e.g. Health = 2013) and never
+    # updates when pages are edited. Always derive notebook-dirty from the
+    # page-level before/after diff post-refresh (see dirty_notebooks below).
+    unknown = [nb['name'] for nb in fresh_nbs
+               if not cache.get(nb['name']) or not cache[nb['name']].get('id')]
+    unknown_set = set(unknown)
 
-    # Always refresh all notebooks: notebook-level last_modified is frozen at
-    # creation date for older notebooks (e.g. Health = 2013) and is never
-    # updated when pages are edited. Page-level last_modified (compared in
-    # modified_ids below) is the reliable change signal.
+    # Filter to single notebook if specified
+    if notebook_name:
+        matching = [nb for nb in fresh_nbs if nb['name'] == notebook_name]
+        if not matching:
+            raise ValueError(f"Notebook '{notebook_name}' not found")
+        fresh_nbs = matching
+
+    # Always refresh all notebooks (see note above re: broken notebook LM).
     to_refresh = [nb['name'] for nb in fresh_nbs]
     before = _snapshot_pages(cache)
 
-    _set_step(f'refreshing {len(to_refresh)} notebook(s)')
-    refresh_done = [0]
+    _set_step(f'refreshing {len(to_refresh)} notebook{"" if len(to_refresh) == 1 else "s"}')
 
     async def _refresh_one(nb_name):
         try:
-            result = nb_name, await refresh_notebook(client, nb_name)
+            return nb_name, await refresh_notebook(client, nb_name)
         except Exception as e:
-            result = nb_name, {'error': str(e)}
-        refresh_done[0] += 1
-        if verbose:
-            info = result[1]
-            if 'error' in info:
-                suffix = f'  [{_format_error(info["error"])}]'
-            else:
-                suffix = (f' — {info.get("pages", "?")} pages, '
-                          f'{info.get("sections", "?")} sections, '
-                          f'{_fmt_size(_notebook_html_size(nb_name))} html')
-            print(f'  [{refresh_done[0]}/{len(to_refresh)}] {nb_name}{suffix}', flush=True)
-        return result
+            return nb_name, {'error': str(e)}
 
     refresh_results = await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
     refresh_errors = {nb: info['error'] for nb, info in refresh_results if 'error' in info}
@@ -376,17 +474,50 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         if before[pid][3] != after[pid][3]
     }
 
-    # Prune orphaned HTML + .meta for deleted pages
-    if deleted_ids:
-        _set_step(f'pruning {len(deleted_ids)} deleted page(s)')
+    # Notebook is "dirty" if any of its pages were added or modified in the
+    # before/after diff. Notebook-level Graph last_modified is unreliable
+    # (see comment near unknown_set computation above).
+    dirty_notebooks = {after[pid][0] for pid in (modified_ids | added_ids)}
+    dirty_set = dirty_notebooks - unknown_set  # ✨ for new notebooks wins over ⚡
+
+    if verbose:
+        info_by_nb = dict(refresh_results)
+        # Bucket page-level diffs by notebook for per-notebook reporting.
+        nb_changes: dict = {}
+        for pid in added_ids:
+            nb_changes.setdefault(after[pid][0], [0, 0, 0])[0] += 1
+        for pid in modified_ids:
+            nb_changes.setdefault(after[pid][0], [0, 0, 0])[1] += 1
         for pid in deleted_ids:
-            p = _content_path(pid)
-            for suffix in ('.html', '.meta'):
-                f = p.with_suffix(suffix)
-                try:
-                    f.unlink()
-                except FileNotFoundError:
-                    pass
+            nb_changes.setdefault(before[pid][0], [0, 0, 0])[2] += 1
+        for idx, nb_name in enumerate(to_refresh, 1):
+            info = info_by_nb.get(nb_name, {})
+            if nb_name in unknown_set:
+                marker = '✨ '
+            elif nb_name in dirty_set:
+                marker = '⚡ '
+            else:
+                marker = ''
+            if 'error' in info:
+                suffix = f'  [{_format_error(info["error"])}]'
+            else:
+                a, m, d = nb_changes.get(nb_name, (0, 0, 0))
+                ch = []
+                if a: ch.append(f'+{a}')
+                if m: ch.append(f'~{m}')
+                if d: ch.append(f'-{d}')
+                pages_suffix = f' ({",".join(ch)})' if ch else ''
+                suffix = (f' — {info.get("pages", "?")} pages{pages_suffix}, '
+                          f'{info.get("sections", "?")} sections, '
+                          f'{_fmt_size(_notebook_html_size(nb_name), precision=0)} html')
+            print(f'             {idx}. {marker}{nb_name}{suffix}', flush=True)
+
+    # Sweep orphans across all per-page artifacts (content html/meta,
+    # rendered html, subject classifications). Self-healing — handles both
+    # `deleted_ids` from this run and any historic orphans (interrupted
+    # prior syncs, page moves that changed page_id, etc.).
+    _set_step('sweeping orphan artifacts')
+    sweep_counts = _sweep_orphans(after_ids)
 
     # Pre-fetch HTML for added + modified pages so embeddings can embed them.
     # Also include pages whose HTML is not loadable: file missing OR .meta
@@ -404,18 +535,18 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         raise ThresholdExceeded('fetch', len(to_fetch_ids), max_changes)
 
     if to_fetch_ids:
-        _set_step(f'fetching {len(to_fetch_ids)} new/modified page(s)')
-        total_fetch = len(to_fetch_ids)
-        _set_progress(0, total_fetch)
+        n_fetch = len(to_fetch_ids)
+        _set_step(f'fetching {n_fetch} new/modified page{"" if n_fetch == 1 else "s"}')
+        _set_progress(0, n_fetch)
         done_count = 0
 
         def _on_page_done(item, result):
             nonlocal done_count
             done_count += 1
-            _set_progress(done_count, total_fetch)
+            _set_progress(done_count, n_fetch)
             if verbose:
                 suffix = f'  [error: {result["error"][:50]}]' if 'error' in result else ''
-                print(f'  [{done_count}/{total_fetch}] {item["label"]}{suffix}', flush=True)
+                print(f'             {done_count}. {item["label"]}{suffix}', flush=True)
 
         # Fetch by page_id directly. find_page's title-based lookup is
         # ambiguous when a section has duplicate titles (legal in OneNote) —
@@ -448,11 +579,21 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     if embed_result.get('aborted'):
         raise ThresholdExceeded('embed', embed_result['pages_to_rebuild'], max_changes)
 
+    # GC orphaned media only when pages were modified or deleted — pure inserts
+    # can't drop resource references. Cheap (single HTML walk + dir scan), so
+    # we don't gate it on a heavier heuristic.
+    gc_result = None
+    if modified_ids or deleted_ids:
+        _set_step('garbage collecting media')
+        r = gc_media(dry_run=False)
+        gc_result = {'deleted': len(r['deleted']),
+                     'reclaimed_bytes': r['orphaned_bytes']}
+
     _set_step(None)  # finalize the last step's "done (Xs)" line
 
     return {
         'notebooks_refreshed': len(to_refresh),
-        'notebooks_dirty':    len(dirty),
+        'notebooks_dirty':    len(dirty_set),
         'notebooks_unknown':  len(unknown),
         'notebooks_failed':   len(refresh_errors),
         'pages_added':        len(added_ids),
@@ -463,6 +604,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         'refresh_errors':     refresh_errors,
         'fetch_errors':       fetch_errors,
         'embeddings':         embed_result,
+        'gc':                 gc_result,
+        'sweep':              sweep_counts,
     }
 
 
@@ -500,11 +643,14 @@ def cmd_sync(args) -> int:
     state: dict = {'status': 'ok', 'started_at': started_at}
     result: dict | None = None
 
+    print(f'[{_now_hms()}] Sync start — {datetime.now().astimezone().strftime("%a %b %d %Y %Z")}', flush=True)
+
     try:
         with duration_limit(args.max_duration, 'sync'):
             result = asyncio.run(_sync_async(
                 force_embed=args.force_embed, verbose=args.verbose,
                 max_changes=args.max_changes, force=args.force,
+                notebook_name=getattr(args, 'notebook', None),
             ))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -565,6 +711,15 @@ def cmd_sync(args) -> int:
             'embed_rebuilt': result['embeddings'].get('pages_rebuilt', result['embeddings'].get('rebuilt', 0)),
             'embed_reused':  result['embeddings'].get('chunks_reused', result['embeddings'].get('reused', 0)),
         })
+        gc = result.get('gc')
+        if gc is not None:
+            log_row['gc_deleted'] = gc['deleted']
+            log_row['gc_bytes']   = gc['reclaimed_bytes']
+        sweep = result.get('sweep') or {}
+        if any(sweep.values()):
+            log_row['sweep_content']  = sweep.get('content', 0)
+            log_row['sweep_rendered'] = sweep.get('rendered', 0)
+            log_row['sweep_subjects'] = sweep.get('subjects', 0)
     if 'error' in state:
         log_row['error'] = state['error']
     _append_log(log_row)
@@ -595,9 +750,18 @@ def cmd_sync(args) -> int:
 
     elapsed = _fmt_elapsed(state['elapsed_sec'])
     if nothing_changed and not has_errors:
-        print(f"sync done in {elapsed} — no changes ({result['notebooks_refreshed']} notebooks)")
+        print(f"[{_now_hms()}] Sync done in {elapsed} — no changes ({result['notebooks_refreshed']} notebooks)")
     else:
-        print(f"sync done in {elapsed}")
+        # Inline summary on the trailer: e.g. "— 1 added, 2 modified".
+        p_added = result.get('pages_added', 0)
+        p_mod   = result.get('pages_modified', 0)
+        p_del   = result.get('pages_deleted', 0)
+        change_parts = []
+        if p_added: change_parts.append(f"{p_added} added")
+        if p_mod:   change_parts.append(f"{p_mod} modified")
+        if p_del:   change_parts.append(f"{p_del} deleted")
+        tail = f" — {', '.join(change_parts)}" if change_parts else ""
+        print(f"[{_now_hms()}] Sync done in {elapsed}{tail}")
         _print_change_block(result)
     return 0
 
@@ -797,7 +961,19 @@ def _print_media_footprint() -> None:
     if not cache_dir.exists():
         return
 
+    # Compute the set of safe_rids whose raw bytes exist on disk. A "raw"
+    # file is anything that doesn't match a derived suffix. Defensive: lets
+    # the footprint reflect actual disk usage even before gc cleans up
+    # orphan metas left by older gc behavior.
+    derived_suf = ('.meta.json', '.ocr.txt', '.caption.txt', '.transcript.txt')
+    raw_safe_rids = {p.name.rsplit('.', 1)[0]
+                     for p in cache_dir.iterdir()
+                     if p.is_file() and not any(p.name.endswith(s) for s in derived_suf)}
+
     for meta_file in cache_dir.glob("*.meta.json"):
+        safe_rid = meta_file.name[:-len('.meta.json')]
+        if safe_rid not in raw_safe_rids:
+            continue
         try:
             meta = json.loads(meta_file.read_text())
             size_bytes = meta.get("size_bytes", 0)
@@ -931,12 +1107,12 @@ def main() -> int:
     sub = ap.add_subparsers(dest='cmd')
 
     ps = sub.add_parser('sync', help='sync now (default if no subcommand)')
+    ps.add_argument('--notebook', type=str, default=None,
+                    help='restrict sync to a single notebook by name')
     ps.add_argument('--force-embed', action='store_true',
                     help='force full embedding rebuild')
     ps.add_argument('--quiet', action='store_true',
                     help='print summary only when changes were applied')
-    ps.add_argument('--silent', '-s', action='store_false', dest='verbose',
-                    help='suppress per-page progress (summary line only)')
     ps.add_argument('--max-duration', type=int, default=DEFAULT_MAX_SECONDS,
                     help=f'seconds before SIGALRM self-kill (default {DEFAULT_MAX_SECONDS}, 0 disables)')
     ps.add_argument('--max-changes', type=int, default=DEFAULT_MAX_CHANGES,

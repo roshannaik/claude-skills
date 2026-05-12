@@ -494,8 +494,13 @@ def save_hydrated_html(page_id: str, html: str, out_path=None):
 # ---------------------------------------------------------------------------
 
 def gc_media(dry_run: bool = False) -> dict:
-    """Delete raw resource bytes that are no longer referenced by any cached
-    page HTML. Preserves .meta.json, .ocr.txt, .transcript.txt always.
+    """Delete all files for resources no longer referenced by any cached page
+    HTML: raw bytes + .meta.json + .ocr.txt + .caption.txt + .transcript.txt.
+    Leaving stale metas behind would leak storage and skew the footprint
+    breakdown (which reads size_bytes from meta).
+
+    `orphaned_bytes` counts raw byte size only — that's the user-visible cost
+    of an orphan; derived metas/text are KB-scale noise.
 
     Returns {deleted: [paths], kept: N, orphaned_bytes: int}.
     """
@@ -515,28 +520,44 @@ def gc_media(dry_run: bool = False) -> dict:
                 continue
         for ref in parse_resources(html):
             referenced.add(ref['resource_id'])
-
-    # Walk cache/page_resources/ and find raw-byte files whose safe-id prefix
-    # doesn't map to any referenced resource_id.
     referenced_safe = {safe_resource_id(r) for r in referenced}
+
+    # Group files into per-resource families by safe_rid prefix. Match the
+    # known multi-dot derived suffixes first; everything else is a raw byte
+    # file with a single-ext name (see MIME_MAP — no multi-dot exts).
+    families: dict[str, list[Path]] = {}
+    for p in PAGE_RESOURCES_DIR.iterdir():
+        if not p.is_file():
+            continue
+        prefix = None
+        for suf in _DERIVED_SUFFIXES:
+            if p.name.endswith(suf):
+                prefix = p.name[:-len(suf)]
+                break
+        if prefix is None:
+            prefix = p.name.rsplit('.', 1)[0]
+        families.setdefault(prefix, []).append(p)
+
     deleted = []
     kept = 0
     orphaned_bytes = 0
-
-    for p in sorted(PAGE_RESOURCES_DIR.iterdir()):
-        if not p.is_file():
-            continue
-        if any(p.name.endswith(s) for s in _DERIVED_SUFFIXES):
-            continue
-        safe = p.name.rsplit('.', 1)[0]  # strip trailing ext
+    for safe, paths in families.items():
         if safe in referenced_safe:
             kept += 1
             continue
-        size = p.stat().st_size
-        orphaned_bytes += size
-        if not dry_run:
-            p.unlink()
-        deleted.append({'path': str(p), 'size_bytes': size})
+        # Orphan family: delete everything, but only count raw bytes toward
+        # the reclaimed total. A "raw" file is anything that doesn't end in
+        # a derived suffix.
+        for p in paths:
+            sz = p.stat().st_size
+            if not any(p.name.endswith(s) for s in _DERIVED_SUFFIXES):
+                orphaned_bytes += sz
+            if not dry_run:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+            deleted.append({'path': str(p), 'size_bytes': sz})
 
     return {'deleted': deleted, 'kept': kept,
             'orphaned_bytes': orphaned_bytes, 'dry_run': dry_run}

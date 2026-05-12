@@ -90,6 +90,7 @@ All modules live in `scripts/`, flat namespace. Heavy imports (`msgraph`, `msal`
 - **Incremental rebuild**: `build_embeddings` carries a page forward unchanged iff `last_modified` matches AND every chunk_id in the prior `pages[pid].chunk_ids` is present in `embeddings.npz`. Otherwise it drops the page's rows and re-chunks.
 - **Model/dim change** → full rebuild auto-triggered by `build_embeddings` (wipes state if `meta.model`/`meta.dim` disagree with current module constants).
 - **Read-only policy**: do not reintroduce `update_page` / `create_page` / `_patch_page_content` / container-setter helpers. The skill is intentionally restricted to reads.
+- **Notebook-level `last_modified` is broken — do not use it for change detection.** Graph's notebook `lastModifiedDateTime` is frozen at notebook creation for older notebooks (e.g. Health = 2013) and never advances when pages are edited. Always derive "notebook dirty" from the page-level before/after diff (`modified_ids ∪ added_ids` → notebooks via `after[pid][0]`); see `_sync_async` in `sync.py`. Page-level `last_modified` is reliable (modulo Graph's flutter, handled by `_parse_lm`'s `>=` tolerance in `load_content_cache`).
 
 ### Harness portability
 
