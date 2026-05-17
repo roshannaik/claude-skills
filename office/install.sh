@@ -34,6 +34,6 @@ fi
 
 echo ""
 echo "Next steps:"
-echo "  1. Set MS_CLIENT_ID in your shell profile (see README.md)"
-echo "  2. Authenticate once via the onenote skill setup, or run:"
-echo "     python3 -c \"import sys; sys.path.insert(0, '$target'); from office_ops import get_auth_token; get_auth_token()\""
+echo "  1. Set MS_CLIENT_ID in ~/.zshrc (see README.md), then: source ~/.zshrc"
+echo "  2. Authenticate once (shared token cache, also used by onenote):"
+echo "     python3 \"$(cd "$SKILL_DIR/.." && pwd)/onenote/scripts/onenote_setup.py\""

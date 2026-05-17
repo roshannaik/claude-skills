@@ -8,9 +8,17 @@ author: clawdi
 
 # Office Files Skill (Excel / Word / PowerPoint)
 
+## Path convention
+
+All paths below are written as `$SKILL_ROOT/office/...`. `$SKILL_ROOT` is the harness's skills directory:
+- **Claude Code**: `~/.claude/skills`
+- **OpenClaw**:    `~/.openclaw/workspace/skills`
+
+When constructing shell commands or inline-Python snippets, expand `$SKILL_ROOT` to the actual path for your harness. `$SKILL_ROOT/office` is typically a symlink to the shared repo directory.
+
 ## Setup
 
-- Script: `~/.claude/skills/office/office_ops.py`
+- Script: `$SKILL_ROOT/office/office_ops.py`
 - Auth: same token as OneNote — `~/.cache/ms_graph_token_cache.json` (no login needed)
 - No extra Azure permissions needed — `Files.Read` / `Files.ReadWrite` cover all Office formats
 
@@ -18,11 +26,11 @@ author: clawdi
 
 ```bash
 # Search OneDrive for a file by name
-python3 ~/.claude/skills/office/office_ops.py search "budget" --type xlsx
+python3 $SKILL_ROOT/office/office_ops.py search "budget" --type xlsx
 
 # List files in a folder
-python3 ~/.claude/skills/office/office_ops.py list-folder "Documents"
-python3 ~/.claude/skills/office/office_ops.py list-folder /
+python3 $SKILL_ROOT/office/office_ops.py list-folder "Documents"
+python3 $SKILL_ROOT/office/office_ops.py list-folder /
 ```
 
 Both return `name | file_id | url`. Use `--file-id` or `--file-path` in subsequent commands.
@@ -31,18 +39,18 @@ Both return `name | file_id | url`. Use `--file-id` or `--file-path` in subseque
 
 ```bash
 # List worksheets
-python3 ~/.claude/skills/office/office_ops.py excel-sheets --file-path "Documents/budget.xlsx"
+python3 $SKILL_ROOT/office/office_ops.py excel-sheets --file-path "Documents/budget.xlsx"
 
 # Read entire used range of a sheet
-python3 ~/.claude/skills/office/office_ops.py excel-used --file-path "Documents/budget.xlsx" "Sheet1"
+python3 $SKILL_ROOT/office/office_ops.py excel-used --file-path "Documents/budget.xlsx" "Sheet1"
 
 # Read specific range
-python3 ~/.claude/skills/office/office_ops.py excel-read --file-path "Documents/budget.xlsx" "Sheet1" "A1:D20"
+python3 $SKILL_ROOT/office/office_ops.py excel-read --file-path "Documents/budget.xlsx" "Sheet1" "A1:D20"
 ```
 
 **Write (inline Python):**
 ```python
-import sys; sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/office'))
+import sys; sys.path.insert(0, '$SKILL_ROOT/office')
 from office_ops import get_file_id, excel_write_range
 fid = get_file_id('Documents/budget.xlsx')
 excel_write_range(fid, 'Sheet1', 'A1:B2', [['Name', 'Value'], ['Total', 42]])
@@ -50,7 +58,7 @@ excel_write_range(fid, 'Sheet1', 'A1:B2', [['Name', 'Value'], ['Total', 42]])
 
 **Read multiple sheets in parallel (inline Python):**
 ```python
-import sys; sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/office'))
+import sys; sys.path.insert(0, '$SKILL_ROOT/office')
 from office_ops import get_file_id, excel_used_range_batch
 fid = get_file_id('Documents/budget.xlsx')
 results = excel_used_range_batch(fid, ['Sheet1', 'Sheet2', 'Sheet3'], drive_id='58B31B88585CA325')
@@ -61,12 +69,12 @@ results = excel_used_range_batch(fid, ['Sheet1', 'Sheet2', 'Sheet3'], drive_id='
 
 ```bash
 # Read full text of a .docx
-python3 ~/.claude/skills/office/office_ops.py word-read --file-path "Documents/report.docx"
+python3 $SKILL_ROOT/office/office_ops.py word-read --file-path "Documents/report.docx"
 ```
 
 **Append content (inline Python):**
 ```python
-import sys; sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/office'))
+import sys; sys.path.insert(0, '$SKILL_ROOT/office')
 from office_ops import get_file_id, word_append
 fid = get_file_id('Documents/report.docx')
 word_append(fid, ['New paragraph here.'], heading='New Section')
@@ -76,18 +84,18 @@ word_append(fid, ['New paragraph here.'], heading='New Section')
 
 ```bash
 # Read all slides as text
-python3 ~/.claude/skills/office/office_ops.py pptx-read --file-path "Documents/deck.pptx"
+python3 $SKILL_ROOT/office/office_ops.py pptx-read --file-path "Documents/deck.pptx"
 ```
 
 ## Excel Tab Cache (AUTO — do this every time)
 
 Whenever you open an Excel file:
-1. Check `~/.claude/skills/office/cache/excel/` for a cached `.json` file for that `file_id`
+1. Check `$SKILL_ROOT/office/cache/excel/` for a cached `.json` file for that `file_id`
 2. If cache exists and fresh, load tabs — no API call needed
 3. If stale or missing, rebuild (see below)
 
 ```python
-import sys; sys.path.insert(0, str(__import__('pathlib').Path.home() / '.claude/skills/office'))
+import sys; sys.path.insert(0, '$SKILL_ROOT/office')
 from office_ops import (load_excel_cache, save_excel_cache, is_excel_cache_stale,
                          rebuild_excel_cache, excel_used_range)
 
@@ -151,20 +159,20 @@ Renames are detected via stable worksheet IDs — descriptions carry forward aut
 
 ```bash
 # Limit rows returned (large sheets)
-python3 ~/.claude/skills/office/office_ops.py excel-used --file-id "ID" "Sheet1" --max-rows 20
+python3 $SKILL_ROOT/office/office_ops.py excel-used --file-id "ID" "Sheet1" --max-rows 20
 
 # Word — truncate long docs (default 8000 chars)
-python3 ~/.claude/skills/office/office_ops.py word-read --file-path "doc.docx" --max-chars 4000
-python3 ~/.claude/skills/office/office_ops.py word-read --file-path "doc.docx" --full
+python3 $SKILL_ROOT/office/office_ops.py word-read --file-path "doc.docx" --max-chars 4000
+python3 $SKILL_ROOT/office/office_ops.py word-read --file-path "doc.docx" --full
 
 # PowerPoint — limit slides (default 20)
-python3 ~/.claude/skills/office/office_ops.py pptx-read --file-path "deck.pptx" --max-slides 10
-python3 ~/.claude/skills/office/office_ops.py pptx-read --file-path "deck.pptx" --full
+python3 $SKILL_ROOT/office/office_ops.py pptx-read --file-path "deck.pptx" --max-slides 10
+python3 $SKILL_ROOT/office/office_ops.py pptx-read --file-path "deck.pptx" --full
 ```
 
 ## Key Notes
 
-- **Always check the Excel cache before any API call** — cache lives in `~/.claude/skills/office/cache/excel/`
+- **Always check the Excel cache before any API call** — cache lives in `$SKILL_ROOT/office/cache/excel/`
 - For shared files (Roshan's OneDrive), always pass `drive_id='58B31B88585CA325'`
 - Excel reads use a persistent workbook session (fast after first call ~0.5s vs ~3.5s cold)
 - Excel writes use `persistChanges=True` session — changes are committed to the file

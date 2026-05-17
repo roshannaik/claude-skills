@@ -12,9 +12,7 @@ Read OneNote notebooks via the Microsoft Graph API (read-only). Supports listing
 python3 --version   # should be 3.11 or higher
 ```
 
-If not installed:
-- macOS: `brew install python`
-- Ubuntu/Debian: `sudo apt install python3`
+If not installed (macOS): `brew install python`
 
 ### 2. Python dependencies
 
@@ -179,13 +177,13 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <key>Label</key>
   <string>com.claude-skills.onenote-sync</string>
 
-  <!-- zsh -ic sources ~/.zshrc so MS_CLIENT_ID + GEMINI_API_KEY are in
-       scope without duplicating secrets into the plist. -->
+  <!-- zsh -ic sources ~/.zshrc so SKILL_ROOT + MS_CLIENT_ID + GEMINI_API_KEY
+       are in scope without duplicating paths/secrets into the plist. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
     <string>-ic</string>
-    <string>exec /usr/bin/python3 $HOME/Projects/skills/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
+    <string>exec /usr/bin/python3 $SKILL_ROOT/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
   </array>
 
   <key>StartInterval</key>
@@ -194,9 +192,9 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <true/>
 
   <key>StandardOutPath</key>
-  <string>$HOME/Projects/skills/onenote/cache/sync.launchd.log</string>
+  <string>$SKILL_ROOT/onenote/cache/sync.launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>$HOME/Projects/skills/onenote/cache/sync.launchd.log</string>
+  <string>$SKILL_ROOT/onenote/cache/sync.launchd.log</string>
 
   <key>ProcessType</key>
   <string>Background</string>
@@ -206,6 +204,8 @@ EOF
 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist
 ```
+
+> `launchctl` runs a shell only for `ProgramArguments` (via `/bin/zsh -ic`), so `$SKILL_ROOT` is expanded there. It is **not** expanded in the `StandardOutPath` / `StandardErrorPath` keys — replace `$SKILL_ROOT` with the literal absolute path in those two lines before writing the plist (e.g. `/Users/you/.claude/skills/onenote/cache/sync.launchd.log`).
 
 Verify it's loaded:
 

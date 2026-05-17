@@ -18,9 +18,9 @@ Three skills for [Claude Code](https://claude.ai/code) and that connect to Micro
 python3 --version   # should be 3.11 or higher
 ```
 
-If not installed:
-- macOS: `brew install python`
-- Ubuntu/Debian: `sudo apt install python3`
+If not installed (macOS): `brew install python`
+
+> macOS only. These skills assume a macOS environment (zsh, `~/.claude/skills`).
 
 ### 2. Python dependencies (onenote + office skills only)
 
@@ -28,7 +28,7 @@ Each skill ships its own `requirements.txt`:
 
 ```bash
 pip3 install -r onenote/requirements.txt   # for the onenote skill
-pip3 install -r office/requirements.txt    # for the office skill (superset of onenote's)
+pip3 install -r office/requirements.txt    # for the office skill
 ```
 
 ### 3. Azure app registration (onenote + office skills only)
@@ -52,18 +52,25 @@ The skills authenticate via Microsoft's device-code flow — no browser popup, w
    - `User.Read`
 9. Click **Grant admin consent** (or just proceed — it will prompt on first auth).
 
-### 4. Set the Client ID environment variable
+### 4. Google AI Studio API key (onenote skill only)
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+The `onenote` skill uses Gemini for semantic-search embeddings, image OCR, and audio/video transcription. Without it, `/onenote query` (semantic search) will not work.
+
+Get a free key at [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey). The `office` and `code-maintenance` skills do not need this.
+
+### 5. Set the environment variables
+
+Add to your `~/.zshrc`:
 
 ```bash
-export MS_CLIENT_ID="your-client-id-from-step-7-above"
+export MS_CLIENT_ID="your-client-id-from-step-7-above"   # onenote + office
+export GEMINI_API_KEY="your-google-ai-studio-key"        # onenote only
 ```
 
 Then reload:
 
 ```bash
-source ~/.zshrc   # or ~/.bashrc
+source ~/.zshrc
 ```
 
 ---
@@ -71,8 +78,8 @@ source ~/.zshrc   # or ~/.bashrc
 ## Installation
 
 ```bash
-git clone https://github.com/roshannaik/claude-skills.git
-cd claude-skills
+git clone https://github.com/roshannaik/claude-skills.git skills
+cd skills
 ./install.sh
 ```
 
@@ -82,8 +89,10 @@ This symlinks each skill into `~/.claude/skills/<skill>`, pointing back to the c
 
 ## First-time authentication (onenote + office)
 
+From the cloned repo directory (`skills/`):
+
 ```bash
-python3 skills/onenote/scripts/onenote_setup.py
+python3 onenote/scripts/onenote_setup.py
 ```
 
 This prints a device code and a URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.

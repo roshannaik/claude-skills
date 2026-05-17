@@ -36,26 +36,29 @@ for skill_dir in "$REPO_DIR"/*/; do
       ln -sfn "$skill_dir" "$target"
       echo "  updated  $skill → $skill_dir"
     fi
-    ((linked++))
+    linked=$((linked + 1))
   elif [[ -e "$target" ]]; then
     echo "  SKIPPED  $skill ($target exists and is not a symlink — remove it manually to install)"
-    ((skipped++))
+    skipped=$((skipped + 1))
   else
     ln -s "$skill_dir" "$target"
     echo "  linked   $skill → $target"
-    ((linked++))
+    linked=$((linked + 1))
   fi
 done
 
 echo ""
 echo "$linked skill(s) installed, $skipped skipped."
 
-if grep -rq "MS_CLIENT_ID" "$REPO_DIR"/*/scripts/*.py 2>/dev/null; then
-  echo ""
-  echo "The onenote and office skills require a Microsoft app Client ID."
-  echo "Add to your shell profile (~/.zshrc or ~/.bashrc):"
-  echo "  export MS_CLIENT_ID=\"your-azure-app-client-id\""
-  echo ""
-  echo "Then authenticate once:"
-  echo "  python3 ~/.claude/skills/onenote/scripts/onenote_setup.py"
-fi
+echo ""
+echo "Environment variables each skill needs — add to ~/.zshrc, then: source ~/.zshrc"
+echo ""
+echo "  onenote           export MS_CLIENT_ID=...    export GEMINI_API_KEY=..."
+echo "  office            export MS_CLIENT_ID=..."
+echo "  code-maintenance  (none)"
+echo ""
+echo "  MS_CLIENT_ID    Azure app registration Client ID — https://portal.azure.com   (README.md §3)"
+echo "  GEMINI_API_KEY  Google AI Studio key             — https://aistudio.google.com/apikey (README.md §4)"
+echo ""
+echo "First-time Microsoft auth (onenote + office share one token cache):"
+echo "  python3 \"$REPO_DIR/onenote/scripts/onenote_setup.py\""

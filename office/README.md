@@ -12,9 +12,7 @@ Read and write Excel, Word, and PowerPoint files stored on OneDrive via the Micr
 python3 --version   # should be 3.11 or higher
 ```
 
-If not installed:
-- macOS: `brew install python`
-- Ubuntu/Debian: `sudo apt install python3`
+If not installed (macOS): `brew install python`
 
 ### 2. Python dependencies
 
@@ -22,7 +20,7 @@ If not installed:
 pip install -r office/requirements.txt
 ```
 
-Packages: `msal`, `msgraph-sdk`, `kiota-abstractions`, `kiota-authentication-azure`, `kiota-http`, `python-docx`, `python-pptx`
+Packages: `msal`, `msgraph-sdk`, `microsoft-kiota-abstractions`, `microsoft-kiota-authentication-azure`, `microsoft-kiota-http`, `python-docx`, `python-pptx`
 
 ### 3. Azure app registration
 
@@ -64,8 +62,8 @@ source ~/.zshrc   # or ~/.bashrc
 ## Installation
 
 ```bash
-git clone https://github.com/roshannaik/claude-skills.git
-cd claude-skills
+git clone https://github.com/roshannaik/claude-skills.git skills
+cd skills
 ./office/install.sh
 ```
 
@@ -81,15 +79,10 @@ To uninstall:
 
 ## First-time authentication
 
-If you have the `onenote` skill installed, the token is already cached. Otherwise run:
+The token cache is shared with the `onenote` skill. From the cloned repo directory (`skills/`), authenticate once:
 
 ```bash
-python3 -c "
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path.home() / '.claude/skills/office'))
-from office_ops import get_auth_token
-get_auth_token()
-"
+python3 onenote/scripts/onenote_setup.py
 ```
 
 This prints a device code and URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.
