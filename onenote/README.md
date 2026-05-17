@@ -155,12 +155,23 @@ The cache (embeddings, HTML snapshots, media) can be archived to OneDrive and re
 # Push cache to OneDrive (overwrites onenote_cache.tar.gz in your drive root)
 python3 $SKILL_ROOT/onenote/scripts/cache_backup.py backup
 
-# Pull cache from OneDrive (prompts before overwriting local cache/)
+# Pull cache from OneDrive (snapshots local cache/ first, then prompts)
 python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore
 
 # Skip the confirmation prompt (e.g. on a fresh machine)
 python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore --yes
+
+# Revert the last restore (cache/ → the pre-restore snapshot)
+python3 $SKILL_ROOT/onenote/scripts/cache_backup.py undo
 ```
+
+`backup` and `restore` are **version-aware**. `sync.py` stamps a `{full_ok_ms, partial_ms}` pair into `cache/.cache_version.json` on each cache-mutating run, and `backup` mirrors it onto the OneDrive file's metadata. Before transferring, the two are compared:
+
+- identical → **skipped** ("nothing to do")
+- one side strictly newer → proceeds
+- the two have diverged → **warns and aborts**, with a suggested next step (restore first / run a clean local sync)
+
+Pass `--force` to override a skip/warn verdict. `restore` always snapshots the current `cache/` to a sibling `cache.previous/` before overwriting, so `undo` can roll back a single restore.
 
 Uses the same MS Graph auth as the skill — no separate credential setup needed.
 

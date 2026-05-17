@@ -55,6 +55,7 @@ LOCK_FILE      = REFS_DIR / '.sync.lock'
 HEARTBEAT_FILE = REFS_DIR / '.sync.heartbeat'
 STATE_FILE     = REFS_DIR / '.sync.state.json'
 LAST_OK_FILE   = REFS_DIR / '.sync.last_ok.json'
+VERSION_FILE   = REFS_DIR / '.cache_version.json'
 LOG_FILE       = REFS_DIR / 'sync.log'
 
 HEARTBEAT_INTERVAL  = 5.0
@@ -158,6 +159,57 @@ def _state_is_clean(state: dict) -> bool:
         return False
     summary = state.get('summary', {}) or {}
     return not summary.get('refresh_errors') and not summary.get('fetch_errors')
+
+
+def _cache_content_changed(result: dict | None) -> bool:
+    """True iff the sync actually mutated cache content.
+
+    Excludes `pages_fetched` — Graph's `lastModifiedDateTime` can flutter,
+    causing a refetch of unchanged content. Only counts real content changes
+    (added/modified/deleted pages) and embedding rebuilds.
+    """
+    if not result:
+        return False
+    emb = result.get('embeddings') or {}
+    return (
+        (result.get('pages_added',    0) or 0)
+        + (result.get('pages_modified', 0) or 0)
+        + (result.get('pages_deleted',  0) or 0)
+        + (emb.get('pages_rebuilt',  emb.get('rebuilt', 0)) or 0)
+    ) >= 1
+
+
+def _update_cache_version(state: dict, *, clean: bool) -> None:
+    """Advance the version timestamps after a cache-mutating sync.
+
+    `partial_ms` advances on any content change; `full_ok_ms` only when the
+    sync was fully clean. Fields not bumped are preserved from the prior file.
+    `full_ok_ms` is always present (0 until the first clean sync) so the file
+    is valid to readers and the invariant partial_ms >= full_ok_ms holds.
+    """
+    finished_iso = state.get('finished_at')
+    if not finished_iso:
+        return
+    now_dt  = datetime.fromisoformat(finished_iso.replace('Z', '+00:00'))
+    now_ms  = int(now_dt.timestamp() * 1000)
+    now_loc = now_dt.astimezone().strftime('%a, %b %-d, %Y at %-I:%M %p %Z')
+
+    cur: dict = {}
+    if VERSION_FILE.exists():
+        try:
+            cur = json.loads(VERSION_FILE.read_text())
+        except Exception:
+            cur = {}
+
+    cur.setdefault('full_ok_ms', 0)
+    cur.setdefault('full_ok_local', '(never)')
+    cur['partial_ms']    = now_ms
+    cur['partial_local'] = now_loc
+    if clean:
+        cur['full_ok_ms']    = now_ms
+        cur['full_ok_local'] = now_loc
+
+    atomic_write(VERSION_FILE, json.dumps(cur, indent=2))
 
 
 def _nothing_changed(result: dict) -> bool:
@@ -692,6 +744,11 @@ def cmd_sync(args) -> int:
     atomic_write(STATE_FILE, json.dumps(state, indent=2))
     if _state_is_clean(state):
         atomic_write(LAST_OK_FILE, json.dumps(state, indent=2))
+
+    # Advance the cache-version timestamps iff this run actually changed
+    # cache content. Partial advances on any change; full_ok only on clean.
+    if _cache_content_changed(result):
+        _update_cache_version(state, clean=_state_is_clean(state))
 
     # One-line JSONL row — flat keys for easy grep/jq.
     log_row = {
