@@ -171,13 +171,26 @@ async def get_section_modified(client, section_id: str) -> str:
 
 
 async def list_pages(client, section_id: str) -> list[dict]:
-    pages = await client.me.onenote.sections.by_onenote_section_id(section_id).pages.get()
+    from msgraph.generated.users.item.onenote.sections.item.pages.pages_request_builder import PagesRequestBuilder
+    all_pages = []
+    skip = 0
+    while True:
+        qp = PagesRequestBuilder.PagesRequestBuilderGetQueryParameters(skip=skip)
+        cfg = PagesRequestBuilder.PagesRequestBuilderGetRequestConfiguration(query_parameters=qp)
+        response = await client.me.onenote.sections.by_onenote_section_id(section_id).pages.get(
+            request_configuration=cfg
+        )
+        batch = response.value or []
+        all_pages.extend(batch)
+        if len(batch) < 20:
+            break
+        skip += 20
     return [
         {"id": p.id, "title": p.title,
          "last_modified": str(p.last_modified_date_time),
          "level": getattr(p, "level", 0) or 0,
          "order": getattr(p, "order", 0) or 0}
-        for p in (pages.value or [])
+        for p in all_pages
     ]
 
 

@@ -504,7 +504,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     to_refresh = [nb['name'] for nb in fresh_nbs]
     before = _snapshot_pages(cache)
 
-    _set_step(f'refreshing {len(to_refresh)} notebook{"" if len(to_refresh) == 1 else "s"}')
+    n_nb = len(to_refresh)
+    _set_step(f'refreshing {n_nb} notebook{"" if n_nb == 1 else "s"}')
 
     async def _refresh_one(nb_name):
         try:
@@ -512,11 +513,35 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         except Exception as e:
             return nb_name, {'error': str(e)}
 
-    refresh_results = await asyncio.gather(*[_refresh_one(n) for n in to_refresh])
+    # Run all refreshes concurrently; print a line as each one finishes so a
+    # timeout mid-step still shows which notebooks completed.
+    refresh_results_dict: dict = {}
+    done_nb = 0
+    tasks = {asyncio.ensure_future(_refresh_one(n)): n for n in to_refresh}
+    for fut in asyncio.as_completed(tasks):
+        nb_name, info = await fut
+        refresh_results_dict[nb_name] = info
+        done_nb += 1
+        status = f'error: {info["error"][:40]}' if 'error' in info else \
+                 f'{info.get("pages","?")}p / {info.get("sections","?")}s'
+        print(f'             [{done_nb}/{n_nb}] {nb_name} — {status}', flush=True)
+
+    refresh_results = list(refresh_results_dict.items())
     refresh_errors = {nb: info['error'] for nb, info in refresh_results if 'error' in info}
 
     cache = _load_cache()
     after = _snapshot_pages(cache)
+
+    # full_after_ids spans all notebooks; used by _sweep_orphans so it doesn't
+    # treat other notebooks' pages as orphans when --notebook narrows the run.
+    full_after_ids = set(after)
+
+    # When restricted to one notebook, narrow both snapshots so that diffs,
+    # the missing-HTML self-heal, and the embed rebuild don't touch other
+    # notebooks' pages.
+    if notebook_name:
+        before = {pid: v for pid, v in before.items() if v[0] == notebook_name}
+        after  = {pid: v for pid, v in after.items()  if v[0] == notebook_name}
 
     before_ids, after_ids = set(before), set(after)
     deleted_ids  = before_ids - after_ids
@@ -526,10 +551,16 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         if before[pid][3] != after[pid][3]
     }
 
-    # Notebook is "dirty" if any of its pages were added or modified in the
-    # before/after diff. Notebook-level Graph last_modified is unreliable
-    # (see comment near unknown_set computation above).
-    dirty_notebooks = {after[pid][0] for pid in (modified_ids | added_ids)}
+    # Pages whose HTML is missing/stale — need fetching regardless of API diff.
+    missing_html_ids = {
+        pid for pid in after_ids
+        if load_content_cache(pid, after[pid][3]) is None
+    }
+
+    # Notebook is "dirty" if any of its pages were added, modified, or have
+    # missing HTML (self-heal fills). Notebook-level Graph last_modified is
+    # unreliable (see comment near unknown_set computation above).
+    dirty_notebooks = {after[pid][0] for pid in (modified_ids | added_ids | missing_html_ids)}
     dirty_set = dirty_notebooks - unknown_set  # ✨ for new notebooks wins over ⚡
 
     if verbose:
@@ -569,16 +600,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     # `deleted_ids` from this run and any historic orphans (interrupted
     # prior syncs, page moves that changed page_id, etc.).
     _set_step('sweeping orphan artifacts')
-    sweep_counts = _sweep_orphans(after_ids)
+    sweep_counts = _sweep_orphans(full_after_ids)
 
-    # Pre-fetch HTML for added + modified pages so embeddings can embed them.
-    # Also include pages whose HTML is not loadable: file missing OR .meta
-    # doesn't match last_modified (e.g. a prior sync timed out mid-fetch, or
-    # the meta was left stale after a section rename).
-    missing_html_ids = {
-        pid for pid in after_ids
-        if load_content_cache(pid, after[pid][3]) is None
-    }
     fetched = failed = 0
     fetch_errors: dict = {}
     to_fetch_ids = added_ids | modified_ids | missing_html_ids
@@ -597,7 +620,13 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
             done_count += 1
             _set_progress(done_count, n_fetch)
             if verbose:
-                suffix = f'  [error: {result["error"][:50]}]' if 'error' in result else ''
+                if 'error' in result:
+                    suffix = f'  [error: {result["error"][:50]}]'
+                else:
+                    size = _fmt_size(result.get('html_bytes', 0))
+                    ms   = result.get('elapsed_ms', 0)
+                    src  = 'cache' if result.get('from_cache') else f'{ms}ms'
+                    suffix = f'  [{size}, {src}]'
                 print(f'             {done_count}. {item["label"]}{suffix}', flush=True)
 
         # Fetch by page_id directly. find_page's title-based lookup is
@@ -624,6 +653,7 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         print(f'  [page {page_num}/{total_pages}] {nb} / {sec} / {title} — {n_chunks} chunks', flush=True)
 
     embed_result = build_embeddings(
+        page_ids=list(after_ids) if notebook_name else None,
         force=force_embed, deleted_page_ids=deleted_ids,
         on_page_embedded=_on_page_embedded if verbose else None,
         max_rebuilds=0 if (force or force_embed) else max_changes,

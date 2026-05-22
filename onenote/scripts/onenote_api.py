@@ -135,6 +135,10 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
     return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
 
 
+_FETCH_CONCURRENCY = 8   # max simultaneous Graph page-content requests
+_FETCH_TIMEOUT_S   = 60  # per-page timeout; hung requests become errors, not hangs
+
+
 async def fetch_pages_by_id(client=None, items: list[dict] = None,
                             on_progress=None) -> list[dict]:
     """Fetch pages by page_id directly, bypassing title-based lookup.
@@ -155,16 +159,31 @@ async def fetch_pages_by_id(client=None, items: list[dict] = None,
             client = make_graph_client()
         return client
 
+    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
     async def _fetch(item):
+        import time
         pid = item['page_id']
         lm  = item.get('last_modified', '')
         try:
             html = load_content_cache(pid, lm)
+            from_cache = html is not None
+            t0 = time.perf_counter()
             if html is None:
                 from onenote_setup import get_page_content
-                html = await get_page_content(_lazy_client(), pid)
+                async with sem:
+                    html = await asyncio.wait_for(
+                        get_page_content(_lazy_client(), pid),
+                        timeout=_FETCH_TIMEOUT_S,
+                    )
                 save_content_cache(pid, html, lm)
-            result = {'id': pid, 'html': html}
+            elapsed_ms = round((time.perf_counter() - t0) * 1000)
+            result = {'id': pid, 'html': html,
+                      'html_bytes': len(html.encode()),
+                      'elapsed_ms': elapsed_ms,
+                      'from_cache': from_cache}
+        except asyncio.TimeoutError:
+            result = {'id': pid, 'error': f'timed out after {_FETCH_TIMEOUT_S}s'}
         except Exception as e:
             result = {'id': pid, 'error': str(e)}
         if on_progress is not None:
