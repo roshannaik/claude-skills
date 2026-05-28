@@ -9,7 +9,7 @@ import asyncio
 from onenote_cache import (
     _load_cache, lookup_notebook, lookup_section, lookup_page,
     update_sections_cache, update_pages_cache,
-    load_content_cache, save_content_cache, strip_html,
+    load_content_cache, save_content_cache, strip_html, html_to_md,
 )
 
 
@@ -21,32 +21,36 @@ async def get_notebooks(client=None):
 
 
 async def get_sections(client, notebook_name: str) -> list:
-    """Fetch sections. Uses cached last_modified to skip re-fetch when unchanged."""
-    from onenote_setup import list_sections, list_notebooks, get_notebook_modified
-    nb = lookup_notebook(notebook_name)
+    """Fetch sections for a notebook.
 
-    if nb and nb.get('id'):
-        nb_id = nb['id']
-        if nb.get('last_modified') and nb.get('sections'):
-            current_mod = await get_notebook_modified(client, nb_id)
-            if current_mod == nb['last_modified']:
-                return [{'id': v['id'], 'name': k, 'last_modified': v.get('last_modified', '')}
-                        for k, v in nb['sections'].items()]
-    else:
+    Notebook-level lastModifiedDateTime is unreliable (frozen at creation for
+    older notebooks) so we never use it as a freshness signal — sections are
+    always fetched live.  If the cached notebook ID returns 404 (stale after a
+    Graph migration) we re-discover the current ID via list_notebooks.
+    """
+    from onenote_setup import list_sections, list_notebooks
+    nb = lookup_notebook(notebook_name)
+    nb_id = nb.get('id') if nb else None
+
+    if not nb_id:
         notebooks = await list_notebooks(client)
         nb_data = next((n for n in notebooks if n['name'].lower() == notebook_name.lower()), None)
         if not nb_data:
             raise ValueError(f"Notebook '{notebook_name}' not found.")
         nb_id = nb_data['id']
 
-    sections = await list_sections(client, nb_id)
-    nb_mod = nb.get('last_modified', '') if nb else ''
-    if not nb_mod:
-        try:
-            nb_mod = await get_notebook_modified(client, nb_id)
-        except Exception:
-            pass
-    update_sections_cache(notebook_name, sections, nb_id, notebook_modified=nb_mod)
+    try:
+        sections = await list_sections(client, nb_id)
+    except Exception:
+        # Cached notebook ID is stale (e.g. Graph 404 after migration); re-discover.
+        notebooks = await list_notebooks(client)
+        nb_data = next((n for n in notebooks if n['name'].lower() == notebook_name.lower()), None)
+        if not nb_data:
+            raise ValueError(f"Notebook '{notebook_name}' not found.")
+        nb_id = nb_data['id']
+        sections = await list_sections(client, nb_id)
+
+    update_sections_cache(notebook_name, sections, nb_id, notebook_modified='')
     return sections
 
 
@@ -119,7 +123,7 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
             from onenote_setup import get_page_content
             html = await get_page_content(_lazy_client(), page_id)
             save_content_cache(page_id, html, last_mod)
-        return {'id': page_id, 'title': page_title, 'content': strip_html(html), 'html': html}
+        return {'id': page_id, 'title': page_title, 'content': html_to_md(html), 'html': html}
 
     pages = await get_pages(_lazy_client(), notebook_name, section_name)
     q = (page_title or '').strip().lower()
@@ -132,7 +136,7 @@ async def find_page(client=None, notebook_name: str = None, section_name: str = 
         from onenote_setup import get_page_content
         html = await get_page_content(_lazy_client(), page['id'])
         save_content_cache(page['id'], html, page.get('last_modified', ''))
-    return {'id': page['id'], 'title': page['title'], 'content': strip_html(html), 'html': html}
+    return {'id': page['id'], 'title': page['title'], 'content': html_to_md(html), 'html': html}
 
 
 _FETCH_CONCURRENCY = 8   # max simultaneous Graph page-content requests
@@ -140,7 +144,7 @@ _FETCH_TIMEOUT_S   = 60  # per-page timeout; hung requests become errors, not ha
 
 
 async def fetch_pages_by_id(client=None, items: list[dict] = None,
-                            on_progress=None) -> list[dict]:
+                            on_progress=None, force_refetch: bool = False) -> list[dict]:
     """Fetch pages by page_id directly, bypassing title-based lookup.
 
     items = [{'page_id': ..., 'last_modified': ..., 'label': '<for progress>'}, ...]
@@ -149,6 +153,10 @@ async def fetch_pages_by_id(client=None, items: list[dict] = None,
     over snapshot diffs). Avoids the title-collision bug in find_page where
     lookup_page returns the first match — duplicate titles within a section
     cause one of the pages to never get fetched.
+
+    force_refetch: skip the local HTML cache and always pull from Graph. Used
+    when syncing with --force at section/page scope to recover pages whose
+    Graph lastModifiedDateTime is frozen at creation time.
 
     on_progress: optional callable(item, result) called after each completion.
     """
@@ -166,7 +174,7 @@ async def fetch_pages_by_id(client=None, items: list[dict] = None,
         pid = item['page_id']
         lm  = item.get('last_modified', '')
         try:
-            html = load_content_cache(pid, lm)
+            html = None if force_refetch else load_content_cache(pid, lm)
             from_cache = html is not None
             t0 = time.perf_counter()
             if html is None:

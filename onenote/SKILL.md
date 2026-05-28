@@ -133,11 +133,8 @@ scripts/onenote_ops.py list-notebooks
 scripts/onenote_ops.py list-sections "Health"
 scripts/onenote_ops.py list-pages "Health" "Supplements"
 
-# Read a page (plain text — the usual one for answering questions)
+# Read a page (markdown — preserves tables, headings, lists)
 scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
-
-# Raw HTML (when markup matters)
-scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
 
 # Read multiple pages in parallel (flat triplets: NOTEBOOK SECTION PAGE ...)
 scripts/onenote_ops.py read-pages \
@@ -153,23 +150,7 @@ For exactly 2 pages that are likely warm-cache hits, parallel `read-page` Bash c
 
 ### Long journal / log pages
 
-`read-page` returns the full page content. Pipe through `head -c N` if you only need a peek.
-
-### Parsing note containers
-
-OneNote pages use absolute-positioned `<div>` blocks as note containers — each is a separate visual block. When asking "what's in X", prefer container-based parsing over flattened text:
-
-```python
-import re
-containers = re.findall(
-    r'<div style="position:absolute;[^"]*">(.*?)(?=<div style="position:absolute|</body>)',
-    html, re.DOTALL,
-)
-for i, c in enumerate(containers, 1):
-    text = re.sub(r'<[^>]+>', ' ', c)
-    text = re.sub(r'\s+', ' ', text).strip()
-    print(f"[{i}] {text[:120]}")
-```
+`read-page` returns the full page content as markdown — tables, headings, and lists are preserved. Pipe through `head -c N` if you only need a peek.
 
 ---
 

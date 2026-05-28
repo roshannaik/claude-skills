@@ -22,7 +22,7 @@ self-kill, so a sync can never wedge launchd indefinitely.
 One JSONL row per run is appended to cache/sync.log for post-hoc auditing.
 
 Subcommands:
-  sync.py [sync] [--notebook NAME] [--force-embed] [--quiet]
+  sync.py [sync] [--notebook NAME[/SECTION[/PAGE]]] [--force-embed] [--quiet]
                  [--max-duration N] [--max-changes N] [--force]
   sync.py status [-v|--verbose]               report idle / running state +
                                               cache size breakdown
@@ -473,7 +473,9 @@ def _snapshot_pages(cache: dict) -> dict:
 
 async def _sync_async(force_embed: bool, verbose: bool = False,
                       max_changes: int = 0, force: bool = False,
-                      notebook_name: str | None = None) -> dict:
+                      notebook_name: str | None = None,
+                      section_name: str | None = None,
+                      page_title: str | None = None) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
     from onenote_api import refresh_notebook, fetch_pages_by_id
 
@@ -536,12 +538,16 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     # treat other notebooks' pages as orphans when --notebook narrows the run.
     full_after_ids = set(after)
 
-    # When restricted to one notebook, narrow both snapshots so that diffs,
-    # the missing-HTML self-heal, and the embed rebuild don't touch other
-    # notebooks' pages.
+    # Narrow both snapshots to the requested scope (notebook / section / page).
     if notebook_name:
         before = {pid: v for pid, v in before.items() if v[0] == notebook_name}
         after  = {pid: v for pid, v in after.items()  if v[0] == notebook_name}
+    if section_name:
+        before = {pid: v for pid, v in before.items() if v[1] == section_name}
+        after  = {pid: v for pid, v in after.items()  if v[1] == section_name}
+    if page_title:
+        before = {pid: v for pid, v in before.items() if v[2] == page_title}
+        after  = {pid: v for pid, v in after.items()  if v[2] == page_title}
 
     before_ids, after_ids = set(before), set(after)
     deleted_ids  = before_ids - after_ids
@@ -606,6 +612,12 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     fetch_errors: dict = {}
     to_fetch_ids = added_ids | modified_ids | missing_html_ids
 
+    # --force means "ignore timestamps at the given scope" — re-fetch all
+    # pages in scope regardless of last_modified. Recovers pages whose Graph
+    # lastModifiedDateTime is frozen at creation and never advances.
+    if force:
+        to_fetch_ids |= after_ids
+
     if not force and max_changes > 0 and len(to_fetch_ids) > max_changes:
         raise ThresholdExceeded('fetch', len(to_fetch_ids), max_changes)
 
@@ -636,7 +648,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
                   'last_modified': after[pid][3],
                   'label': f'{after[pid][0]} / {after[pid][1]} / {after[pid][2]}'}
                  for pid in to_fetch_ids]
-        results = await fetch_pages_by_id(client, items, on_progress=_on_page_done)
+        results = await fetch_pages_by_id(client, items, on_progress=_on_page_done,
+                                          force_refetch=force)
         label_by_id = {it['page_id']: it['label'] for it in items}
         for r in results:
             if 'error' in r:
@@ -653,8 +666,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
         print(f'  [page {page_num}/{total_pages}] {nb} / {sec} / {title} — {n_chunks} chunks', flush=True)
 
     embed_result = build_embeddings(
-        page_ids=list(after_ids) if notebook_name else None,
-        force=force_embed, deleted_page_ids=deleted_ids,
+        page_ids=list(after_ids) if (notebook_name or section_name or page_title) else None,
+        force=force_embed or force, deleted_page_ids=deleted_ids,
         on_page_embedded=_on_page_embedded if verbose else None,
         max_rebuilds=0 if (force or force_embed) else max_changes,
     )
@@ -729,10 +742,14 @@ def cmd_sync(args) -> int:
 
     try:
         with duration_limit(args.max_duration, 'sync'):
+            nb_arg = getattr(args, 'notebook', None) or ''
+            nb_parts = [p.strip() for p in nb_arg.split('/', 2)] if nb_arg else []
             result = asyncio.run(_sync_async(
                 force_embed=args.force_embed, verbose=args.verbose,
                 max_changes=args.max_changes, force=args.force,
-                notebook_name=getattr(args, 'notebook', None),
+                notebook_name=nb_parts[0] if len(nb_parts) >= 1 else None,
+                section_name=nb_parts[1] if len(nb_parts) >= 2 else None,
+                page_title=nb_parts[2]    if len(nb_parts) >= 3 else None,
             ))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -1195,7 +1212,8 @@ def main() -> int:
 
     ps = sub.add_parser('sync', help='sync now (default if no subcommand)')
     ps.add_argument('--notebook', type=str, default=None,
-                    help='restrict sync to a single notebook by name')
+                    help='restrict sync scope: Notebook  or  Notebook/Section  or  '
+                         'Notebook/Section/Page  (use / as separator).')
     ps.add_argument('--force-embed', action='store_true',
                     help='force full embedding rebuild')
     ps.add_argument('--quiet', action='store_true',
@@ -1207,7 +1225,9 @@ def main() -> int:
                          f'(default {DEFAULT_MAX_CHANGES}, 0 disables). '
                          f'Guards against runaway rebuilds from Graph last_modified flutter.')
     ps.add_argument('--force', '-f', action='store_true',
-                    help='bypass --max-changes threshold')
+                    help='ignore last_modified timestamps — re-fetch HTML and rebuild '
+                         'embeddings for all pages in scope regardless of whether '
+                         'Graph reports them as changed. Also bypasses --max-changes.')
 
     status_parser = sub.add_parser('status',  help='report idle / running state, plus cache sizes')
     status_parser.add_argument('-v', '--verbose', action='store_true',

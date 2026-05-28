@@ -312,6 +312,94 @@ def strip_html(html: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
+def html_to_md(html: str) -> str:
+    from bs4 import BeautifulSoup, NavigableString
+    soup = BeautifulSoup(html, 'html.parser')
+    body = soup.body or soup
+
+    def _cell_text(td):
+        return ' '.join(td.get_text(' ', strip=True).split())
+
+    def _join(parts):
+        """Join parts, inserting a space when adjacent word chars would otherwise merge."""
+        result = ''
+        for p in parts:
+            if result and p and re.search(r'\w$', result) and re.match(r'^\w', p):
+                result += ' '
+            result += p
+        return result
+
+    def _convert(node, depth=0) -> str:
+        if isinstance(node, NavigableString):
+            return str(node)
+        tag = node.name
+        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            return f"\n{'#' * int(tag[1])} {node.get_text(' ', strip=True)}\n"
+        if tag == 'table':
+            rows = node.find_all('tr')
+            if not rows:
+                return ''
+            out = []
+            for i, row in enumerate(rows):
+                cells = [_cell_text(c) for c in row.find_all(['th', 'td'])]
+                out.append('| ' + ' | '.join(cells) + ' |')
+                if i == 0:
+                    out.append('|' + '---|' * len(cells))
+            return '\n' + '\n'.join(out) + '\n'
+        if tag in ('ul', 'ol'):
+            indent = '  ' * depth
+            out = []
+            j = 0
+            for child in node.children:
+                if isinstance(child, NavigableString):
+                    text = str(child).strip()
+                    if text:
+                        out.append(f"{indent}{text}")
+                    continue
+                ctag = child.name
+                if ctag is None or ctag == 'br':
+                    continue
+                if ctag == 'li':
+                    prefix = f'{j+1}.' if tag == 'ol' else '-'
+                    j += 1
+                    text_parts = []
+                    nested_blocks = []
+                    for c in child.children:
+                        if hasattr(c, 'name') and c.name in ('ul', 'ol'):
+                            nested_blocks.append(_convert(c, depth + 1))
+                        else:
+                            text_parts.append(_convert(c, depth))
+                    li_text = re.sub(r'\s+', ' ', _join(text_parts)).strip()
+                    out.append(f"{indent}{prefix} {li_text}")
+                    for block in nested_blocks:
+                        out.append(block.rstrip('\n'))
+                else:
+                    # Non-li child inside ul (invalid HTML but OneNote produces it)
+                    content = _convert(child, depth).strip()
+                    if content:
+                        out.append(f"{indent}{content}" if indent else content)
+            return '\n'.join(out) + '\n'
+        if tag == 'li':
+            return ''
+        parts = [_convert(c, depth) for c in node.children]
+        inner = _join(parts).strip()
+        if tag == 'p':
+            return (inner + '\n') if inner else ''
+        if tag == 'br':
+            return '\n'
+        if tag in ('b', 'strong'):
+            return f'**{inner}**' if inner else ''
+        if tag in ('i', 'em'):
+            return f'*{inner}*' if inner else ''
+        if tag == 'a':
+            href = node.get('href', '')
+            return f'[{inner}]({href})' if href else inner
+        return inner
+
+    md = _convert(body)
+    return re.sub(r'\n{3,}', '\n\n', md).strip()
+
+
 # ---------------------------------------------------------------------------
 # Whole-corpus walkers
 # ---------------------------------------------------------------------------
