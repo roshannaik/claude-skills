@@ -367,7 +367,7 @@ async def main_async(args):
     # fetch-media --status/--unstick are diagnostic only; they also skip the
     # client to avoid triggering auth when the user just wants to check/clear
     # a stuck lock.
-    skip_client = (args.cmd in ('read-page', 'read-page-html',
+    skip_client = (args.cmd in ('read-page', 'read-page-html', 'read-pages',
                                  'render-page', 'query', 'query-by-page',
                                  'get-chunk', 'search-title', 'search-content')
                    or (args.cmd == 'fetch-media'
@@ -400,6 +400,26 @@ async def main_async(args):
         result = await find_page(client=client, notebook_name=args.notebook,
                                  section_name=args.section, page_title=args.page)
         print(result['html'])
+
+    elif args.cmd == 'read-pages':
+        if not args.pages or len(args.pages) % 3 != 0:
+            print('Error: read-pages requires page specs as triplets: NOTEBOOK SECTION PAGE ...',
+                  file=sys.stderr)
+            sys.exit(1)
+        specs = [
+            {'notebook': args.pages[i], 'section': args.pages[i + 1], 'page': args.pages[i + 2]}
+            for i in range(0, len(args.pages), 3)
+        ]
+        results = await find_pages_batch(client=client, page_specs=specs)
+        for spec, result in zip(specs, results):
+            nb, sec = spec['notebook'], spec['section']
+            title = result.get('title') or spec['page']
+            print(f'=== {title} ({nb} / {sec}) ===')
+            if result.get('error'):
+                print(f"ERROR: {result['error']}")
+            else:
+                print(result['content'])
+            print()
 
     elif args.cmd == 'refresh':
         stats = await refresh_notebook(client, args.notebook)
@@ -514,6 +534,10 @@ if __name__ == '__main__':
     p.add_argument('notebook')
     p.add_argument('section')
     p.add_argument('page')
+
+    p = sub.add_parser('read-pages',
+                       help='Read multiple pages in parallel (flat triplets: NB SEC PAGE ...)')
+    p.add_argument('pages', nargs='+', metavar='NOTEBOOK SECTION PAGE')
 
     p = sub.add_parser('refresh')
     p.add_argument('notebook', help='Refresh all sections + pages in parallel')

@@ -110,6 +110,13 @@ Override flags:
 
 Use the matched chunks (via `onenote_chunks.chunk_page(...)` → look up by `chunk_id`) — don't re-slice raw HTML, since chunks are what retrieval actually ranked.
 
+**When to skip step 2 and read the full page instead:**
+
+- **Read the full page** when the query is a broad survey ("what do my notes say about X", "tell me about X", "everything about X") AND the top hit scores ≥0.75 AND its title directly matches the topic. The page likely has many more relevant chunks than `--max-n` surfaces.
+- **Chunks are sufficient** when the query is a narrow factual lookup ("what dose of X do I take", "what was my last Y result", "what is the half-life of Z"). The answer is a single discrete fact; the top chunk contains it and reading more is noise.
+
+When reading full pages, use `read-pages` for 3+ pages; parallel `read-page` Bash calls for exactly 2.
+
 **Citation format:** `Page Title — Notebook / Section [subject-if-non-general]`.
 - *Tea tannin composition — Health / Colitis / Good/Bad Foods [self]*
 - *S3 durability — Interviews / System Design / Cloud Obj store (S3/GCS)* (no tag — general)
@@ -131,7 +138,18 @@ scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
 
 # Raw HTML (when markup matters)
 scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
+
+# Read multiple pages in parallel (flat triplets: NOTEBOOK SECTION PAGE ...)
+scripts/onenote_ops.py read-pages \
+    "Health" "Supplements" "My Stack" \
+    "Health" "Supplements" "Probiotics"
 ```
+
+### Parallel reads
+
+When reading 3 or more pages, use `read-pages` instead of separate `read-page` calls. It accepts page specs as flat triplets (NOTEBOOK SECTION PAGE repeated) and fetches all pages concurrently via `asyncio.gather()` in a single subprocess. Output is delimited blocks — `=== Title (Notebook / Section) ===` followed by plain text content. A page that errors emits `ERROR: ...` in its block; the remaining pages still succeed.
+
+For exactly 2 pages that are likely warm-cache hits, parallel `read-page` Bash calls are fine.
 
 ### Long journal / log pages
 
@@ -239,6 +257,7 @@ Report the summary line from the output (pages added/modified/deleted, embed reb
 - **Semantic search first** (tier 1) for any content question. Tier 2/3 are for when the user names an exact page or keyword.
 - **Decide `--include-general` carefully.** If the query needs reference/protocol/normal-range info to be answerable, pass it. Otherwise default strict.
 - **`read-page` returns full content.**
+- **Reading 3+ pages? Use `read-pages`** — one subprocess, async concurrent fetches. Use parallel `read-page` Bash calls only for exactly 2 pages that are likely cache hits.
 - **Never read `cache/onenote_cache.json` directly** — use the CLI.
 - **Read-only skill.** `update_page` / `create_page` have been removed. Do not try to modify OneNote content from this skill.
 - **`find_page()`** does case-insensitive, whitespace-insensitive title matching.
