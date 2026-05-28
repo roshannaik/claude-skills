@@ -74,7 +74,7 @@ cd claude-skills
 ./onenote/install.sh
 ```
 
-This creates a symlink `~/.claude/skills/onenote` pointing to the cloned repo directory. No files are copied — edits in the repo are reflected immediately, and `git pull` is all you need to update.
+This creates a symlink `~/.claude/skills/onenote` pointing to the cloned repo directory. No files are copied — edits in the repo are reflected immediately, and `git pull` is all you need to update. This is for **Claude Code** only; openclaw installs skills via the `"install"` metadata in `SKILL.md`.
 
 To uninstall:
 
@@ -82,24 +82,16 @@ To uninstall:
 ./onenote/uninstall.sh
 ```
 
-### `$SKILL_ROOT` convention
+### Running CLI commands
 
-CLI examples in this README reference `$SKILL_ROOT/onenote/...`. Export it once to match your harness's skill install:
-
-```bash
-# Claude Code
-export SKILL_ROOT=~/.claude/skills
-
-# openclaw
-# export SKILL_ROOT=~/.openclaw/workspace/skills
-```
+All `scripts/...` and `cache/...` paths below are relative to this skill's install directory — `cd` into it first, or substitute the absolute path. This works the same whether your harness installs the skill at `~/.claude/skills/onenote/`, an openclaw skills dir, or any cloned-repo location.
 
 ---
 
 ## First-time authentication
 
 ```bash
-python3 $SKILL_ROOT/onenote/scripts/onenote_setup.py
+python3 scripts/onenote_setup.py
 ```
 
 This prints a device code and a URL. Open the URL in any browser, enter the code, and sign in. The token is cached at `~/.cache/ms_graph_token_cache.json` — subsequent runs skip this step entirely.
@@ -136,11 +128,11 @@ Newly shared notebooks need to be opened at least once in OneNote (web, desktop,
 ### Manual sync
 
 ```bash
-python3 $SKILL_ROOT/onenote/scripts/sync.py                  # sync now (per-page progress by default)
-python3 $SKILL_ROOT/onenote/scripts/sync.py sync --silent    # summary line only, no per-page output
-python3 $SKILL_ROOT/onenote/scripts/sync.py sync --force     # bypass --max-changes threshold
-python3 $SKILL_ROOT/onenote/scripts/sync.py status           # idle / running (shows step elapsed + done/total)
-python3 $SKILL_ROOT/onenote/scripts/sync.py unstick          # kill a hung sync
+python3 scripts/sync.py                  # sync now (per-page progress by default)
+python3 scripts/sync.py sync --silent    # summary line only, no per-page output
+python3 scripts/sync.py sync --force     # bypass --max-changes threshold
+python3 scripts/sync.py status           # idle / running (shows step elapsed + done/total)
+python3 scripts/sync.py unstick          # kill a hung sync
 ```
 
 A sync aborts (exit 4) if it would fetch or embed more than 20 pages — guards against runaway rebuilds from Graph `last_modified` flutter. Override with `--max-changes N` (`0` to disable) or `--force` to bypass.
@@ -153,16 +145,16 @@ The cache (embeddings, HTML snapshots, media) can be archived to OneDrive and re
 
 ```bash
 # Push cache to OneDrive (overwrites onenote_cache.tar.gz in your drive root)
-python3 $SKILL_ROOT/onenote/scripts/cache_backup.py backup
+python3 scripts/cache_backup.py backup
 
 # Pull cache from OneDrive (snapshots local cache/ first, then prompts)
-python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore
+python3 scripts/cache_backup.py restore
 
 # Skip the confirmation prompt (e.g. on a fresh machine)
-python3 $SKILL_ROOT/onenote/scripts/cache_backup.py restore --yes
+python3 scripts/cache_backup.py restore --yes
 
 # Revert the last restore (cache/ → the pre-restore snapshot)
-python3 $SKILL_ROOT/onenote/scripts/cache_backup.py undo
+python3 scripts/cache_backup.py undo
 ```
 
 `backup` and `restore` are **version-aware**. `sync.py` stamps a `{full_ok_ms, partial_ms}` pair into `cache/.cache_version.json` on each cache-mutating run, and `backup` mirrors it onto the OneDrive file's metadata. Before transferring, the two are compared:
@@ -177,9 +169,11 @@ Uses the same MS Graph auth as the skill — no separate credential setup needed
 
 ### Schedule a 3-hour background sync (macOS, launchd)
 
-Install a user launch agent that fires every 3 hours and at login:
+Install a user launch agent that fires every 3 hours and at login. Replace `SKILL_DIR` below with the absolute path to this skill's install directory (e.g. `/Users/you/.claude/skills/onenote`):
 
 ```bash
+SKILL_DIR="/absolute/path/to/onenote"   # e.g. /Users/you/.claude/skills/onenote
+
 cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -188,13 +182,13 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <key>Label</key>
   <string>com.claude-skills.onenote-sync</string>
 
-  <!-- zsh -ic sources ~/.zshrc so SKILL_ROOT + MS_CLIENT_ID + GEMINI_API_KEY
-       are in scope without duplicating paths/secrets into the plist. -->
+  <!-- zsh -ic sources ~/.zshrc so MS_CLIENT_ID + GEMINI_API_KEY
+       are in scope without duplicating secrets into the plist. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
     <string>-ic</string>
-    <string>exec /usr/bin/python3 $SKILL_ROOT/onenote/scripts/sync.py sync --quiet --max-duration 600</string>
+    <string>exec /usr/bin/python3 ${SKILL_DIR}/scripts/sync.py sync --quiet --max-duration 600</string>
   </array>
 
   <key>StartInterval</key>
@@ -203,9 +197,9 @@ cat > ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist <<EOF
   <true/>
 
   <key>StandardOutPath</key>
-  <string>$SKILL_ROOT/onenote/cache/sync.launchd.log</string>
+  <string>${SKILL_DIR}/cache/sync.launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>$SKILL_ROOT/onenote/cache/sync.launchd.log</string>
+  <string>${SKILL_DIR}/cache/sync.launchd.log</string>
 
   <key>ProcessType</key>
   <string>Background</string>
@@ -216,7 +210,7 @@ EOF
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-skills.onenote-sync.plist
 ```
 
-> `launchctl` runs a shell only for `ProgramArguments` (via `/bin/zsh -ic`), so `$SKILL_ROOT` is expanded there. It is **not** expanded in the `StandardOutPath` / `StandardErrorPath` keys — replace `$SKILL_ROOT` with the literal absolute path in those two lines before writing the plist (e.g. `/Users/you/.claude/skills/onenote/cache/sync.launchd.log`).
+> `${SKILL_DIR}` is expanded by your shell (via the heredoc) when the plist is written, so the resulting file contains literal absolute paths — `launchctl` itself does not run shells against `StandardOutPath` / `StandardErrorPath`, so the substitution has to happen at install time.
 
 Verify it's loaded:
 

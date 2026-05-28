@@ -30,20 +30,14 @@ metadata:
 
 # OneNote Skill
 
-## Path convention
-
-All paths below are written as `$SKILL_ROOT/onenote/...`. `$SKILL_ROOT` is the harness's skills directory:
-- **Claude Code**: `~/.claude/skills`
-- **OpenClaw**:    `~/.openclaw/workspace/skills`
-
-When constructing shell commands, expand `$SKILL_ROOT` to the actual path for your harness. $SKILL_ROOT/onenote will be typically a symlink to shared directory.
+All `scripts/...` and `cache/...` paths below are relative to this skill's directory — invoke them from wherever the harness has loaded this skill.
 
 ## Setup
 
-- Auth + Graph client:   `$SKILL_ROOT/onenote/scripts/onenote_setup.py`
-- Main CLI:              `$SKILL_ROOT/onenote/scripts/onenote_ops.py`
+- Auth + Graph client:   `scripts/onenote_setup.py`
+- Main CLI:              `scripts/onenote_ops.py`
 - Token cache:           `~/.cache/ms_graph_token_cache.json` (no login needed)
-- Cache layout (`$SKILL_ROOT/onenote/cache/`):
+- Cache layout (`cache/`):
   - `onenote_cache.json` — notebook/section/page index (**never read directly**)
   - `page_index.txt` — grep-able `title\tnotebook\tsection\tpage_id`
   - `page_content/*.html` + `.meta` — HTML snapshots keyed by page ID
@@ -52,7 +46,7 @@ When constructing shell commands, expand `$SKILL_ROOT` to the actual path for yo
   - `page_subjects.json` — per-page subject label (`self` / `general` / `<Person>`)
   - `embeddings.npz` + `embeddings_meta.json` — chunked multimodal index (768d)
 
-Requires `MS_CLIENT_ID' in env for accessing MS Graph API.
+Requires `MS_CLIENT_ID` in env for accessing MS Graph API.
 Requires `GEMINI_API_KEY` in env for semantic search. Uses `gemini-embedding-2-preview` @ 768d with a unified text+image+PDF+audio vector space.
 
 ---
@@ -63,17 +57,17 @@ Escalate only as needed.
 
 | Tier | When | Cost | Command |
 |---|---|---|---|
-| **1. Semantic search** | Natural-language question, conceptual topic, "what do my notes say about X". Surfaces both text and embedded media (images, PDFs, audio, video). | 1 Gemini embed call (~180–300 ms steady) | `onenote_ops.py query "<query>"` |
-| **2. Title search** | User named a page or you know the exact title | instant, no API | `onenote_ops.py search-title "<title>"` |
-| **3. Content grep** | Exact keyword over cached page HTML | ~100 ms, no API | `onenote_ops.py search-content "<keyword>"` |
-| **4. Full page read** | After routing via a tier above | 1 API call first time, cached after | `onenote_ops.py read-page <nb> <sec> <page>` |
+| **1. Semantic search** | Natural-language question, conceptual topic, "what do my notes say about X". Surfaces both text and embedded media (images, PDFs, audio, video). | 1 Gemini embed call (~180–300 ms steady) | `scripts/onenote_ops.py query "<query>"` |
+| **2. Title search** | User named a page or you know the exact title | instant, no API | `scripts/onenote_ops.py search-title "<title>"` |
+| **3. Content grep** | Exact keyword over cached page HTML | ~100 ms, no API | `scripts/onenote_ops.py search-content "<keyword>"` |
+| **4. Full page read** | After routing via a tier above | 1 API call first time, cached after | `scripts/onenote_ops.py read-page <nb> <sec> <page>` |
 
 ### Semantic search (Tier 1) — primary fast path
 
 Chunked + multimodal: each query hits text chunks, page summaries, image OCR, scene captions, raw image/PDF/audio vectors, and audio/video transcripts in one unified 768-d space.
 
 ```bash
-python3 $SKILL_ROOT/onenote/scripts/onenote_ops.py query "<query>" \
+python3 scripts/onenote_ops.py query "<query>" \
     [--top-k 10] [--max-n 3] [--notebook NB] [--subject LIST] [--include-general] [--no-subject-filter]
 ```
 
@@ -128,20 +122,20 @@ Use the matched chunks (via `onenote_chunks.chunk_page(...)` → look up by `chu
 
 ```bash
 # List structure
-onenote_ops.py list-notebooks
-onenote_ops.py list-sections "Health"
-onenote_ops.py list-pages "Health" "Supplements"
+scripts/onenote_ops.py list-notebooks
+scripts/onenote_ops.py list-sections "Health"
+scripts/onenote_ops.py list-pages "Health" "Supplements"
 
 # Read a page (plain text — the usual one for answering questions)
-onenote_ops.py read-page "Health" "Supplements" "My Stack"
+scripts/onenote_ops.py read-page "Health" "Supplements" "My Stack"
 
 # Raw HTML (when markup matters)
-onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
+scripts/onenote_ops.py read-page-html "Health" "Supplements" "My Stack"
 ```
 
 ### Long journal / log pages
 
-**Don't truncate long journal/log pages when searching within them.** When a top-ranked semantic hit is a daily log, treatment log, or chronological journal (`Treatment Log`, `Progress`, `Daily Notes`, etc.), read the full page — specific entries often live deep inside a multi-month entry and will be missed by a default 4K-char slice. Pass `--full` in the CLI or read `p['content']` unsliced in inline Python.
+`read-page` returns the full page content. Pipe through `head -c N` if you only need a peek.
 
 ### Parsing note containers
 
@@ -181,8 +175,7 @@ For questions spanning multiple pages — fetches run concurrently:
 
 ```python
 import asyncio, sys
-import os
-sys.path.insert(0, os.path.expandvars('$SKILL_ROOT/onenote/scripts'))
+sys.path.insert(0, 'scripts')  # or absolute path to this skill's scripts/ dir
 from onenote_setup import make_graph_client
 from onenote_ops import find_pages_batch, refresh_all_notebooks
 
@@ -232,7 +225,7 @@ All three ingest steps are incremental — unchanged content is carried forward 
 If the user asks to sync, refresh the cache, or update the cache, run:
 
 ```bash
-python3 $SKILL_ROOT/onenote/scripts/sync.py 2>&1
+python3 scripts/sync.py 2>&1
 ```
 
 Report the summary line from the output (pages added/modified/deleted, embed rebuilt). Do not run a sync unless the user explicitly requests it.
@@ -245,8 +238,8 @@ Report the summary line from the output (pages added/modified/deleted, embed reb
 - **Always cite pages**, using `Title — Notebook / Section [subject-if-non-self-and-non-general]`. Don't dump page IDs.
 - **Semantic search first** (tier 1) for any content question. Tier 2/3 are for when the user names an exact page or keyword.
 - **Decide `--include-general` carefully.** If the query needs reference/protocol/normal-range info to be answerable, pass it. Otherwise default strict.
-- **Long journal/log pages: don't truncate.** Load full content or grep within HTML — specific entries are often deep in multi-month logs.
-- **Never read `onenote_cache.json` directly** — use the CLI.
+- **`read-page` returns full content.**
+- **Never read `cache/onenote_cache.json` directly** — use the CLI.
 - **Read-only skill.** `update_page` / `create_page` have been removed. Do not try to modify OneNote content from this skill.
 - **`find_page()`** does case-insensitive, whitespace-insensitive title matching.
 - **`strip_html()`** from `onenote_ops` gives clean readable text from page HTML.

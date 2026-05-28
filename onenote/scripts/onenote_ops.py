@@ -394,11 +394,7 @@ async def main_async(args):
     elif args.cmd == 'read-page':
         result = await find_page(client=client, notebook_name=args.notebook,
                                  section_name=args.section, page_title=args.page)
-        content = result['content']
-        max_chars = 0 if args.full else args.max_chars
-        if max_chars and len(content) > max_chars:
-            content = content[:max_chars] + f'\n... [truncated — {len(result["content"])} chars total, use --full for complete content]'
-        print(content)
+        print(result['content'])
 
     elif args.cmd == 'read-page-html':
         result = await find_page(client=client, notebook_name=args.notebook,
@@ -513,9 +509,6 @@ if __name__ == '__main__':
     p.add_argument('notebook')
     p.add_argument('section')
     p.add_argument('page')
-    p.add_argument('--max-chars', type=int, default=4000, dest='max_chars',
-                   help='Truncate content at N chars (default 4000). Use --full to disable.')
-    p.add_argument('--full', action='store_true', help='Return full content without truncation')
 
     p = sub.add_parser('read-page-html')
     p.add_argument('notebook')
