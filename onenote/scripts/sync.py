@@ -509,18 +509,18 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     n_nb = len(to_refresh)
     _set_step(f'refreshing {n_nb} notebook{"" if n_nb == 1 else "s"}')
 
-    # Limit concurrent notebook refreshes and total list_pages calls to avoid
-    # Graph 429s when syncing many notebooks at once.
-    nb_sem      = asyncio.Semaphore(3)   # max notebooks refreshing at once
-    section_sem = asyncio.Semaphore(4)   # max concurrent list_pages across all notebooks
+    # Single semaphore caps total concurrent Graph API calls (list_sections +
+    # list_pages combined) across all notebooks. list_sections must finish
+    # before list_pages can start for a given notebook, so a shared limit
+    # of 4 naturally interleaves both call types without over-requesting.
+    graph_sem = asyncio.Semaphore(4)
 
     async def _refresh_one(nb_name):
-        async with nb_sem:
-            try:
-                return nb_name, await refresh_notebook(client, nb_name,
-                                                       section_sem=section_sem)
-            except Exception as e:
-                return nb_name, {'error': str(e)}
+        try:
+            return nb_name, await refresh_notebook(client, nb_name,
+                                                   graph_sem=graph_sem)
+        except Exception as e:
+            return nb_name, {'error': str(e)}
 
     # Run all refreshes concurrently (gated by nb_sem); print a line as each
     # one finishes so a timeout mid-step still shows which notebooks completed.
