@@ -257,6 +257,7 @@ Report the summary line from the output (pages added/modified/deleted, embed reb
 - **Semantic search first** (tier 1) for any content question. Tier 2/3 are for when the user names an exact page or keyword.
 - **Decide `--include-general` carefully.** If the query needs reference/protocol/normal-range info to be answerable, pass it. Otherwise default strict.
 - **`read-page` returns full content.**
+- **Don't re-read pages already in context.** Before calling `read-page` or `read-pages`, scan the current conversation for prior reads of the same page (by title). If the content is already present, use it directly — skip the call.
 - **Reading 3+ pages? Use `read-pages`** — one subprocess, async concurrent fetches. Use parallel `read-page` Bash calls only for exactly 2 pages that are likely cache hits.
 - **Never read `cache/onenote_cache.json` directly** — use the CLI.
 - **Read-only skill.** `update_page` / `create_page` have been removed. Do not try to modify OneNote content from this skill.
