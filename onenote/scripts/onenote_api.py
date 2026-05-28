@@ -81,13 +81,24 @@ async def get_pages(client, notebook_name: str, section_name: str) -> list:
     return pages
 
 
-async def refresh_notebook(client, notebook_name: str) -> dict:
-    """Refresh all sections + pages in parallel via asyncio.gather()."""
+_SECTION_PAGES_CONCURRENCY = 8   # max concurrent list_pages calls across all notebooks
+
+
+async def refresh_notebook(client, notebook_name: str,
+                           section_sem: asyncio.Semaphore = None) -> dict:
+    """Refresh all sections + pages.
+
+    section_sem: shared semaphore from the caller that caps total concurrent
+    list_pages calls across all notebooks being refreshed in parallel.
+    A per-call default is created when not provided (single-notebook callers).
+    """
     from onenote_setup import list_pages
     sections = await get_sections(client, notebook_name)
+    sem = section_sem or asyncio.Semaphore(_SECTION_PAGES_CONCURRENCY)
 
     async def _fetch(sec):
-        pages = await list_pages(client, sec['id'])
+        async with sem:
+            pages = await list_pages(client, sec['id'])
         update_pages_cache(notebook_name, sec['name'], pages)
         return len(pages)
 

@@ -509,14 +509,21 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     n_nb = len(to_refresh)
     _set_step(f'refreshing {n_nb} notebook{"" if n_nb == 1 else "s"}')
 
-    async def _refresh_one(nb_name):
-        try:
-            return nb_name, await refresh_notebook(client, nb_name)
-        except Exception as e:
-            return nb_name, {'error': str(e)}
+    # Limit concurrent notebook refreshes and total list_pages calls to avoid
+    # Graph 429s when syncing many notebooks at once.
+    nb_sem      = asyncio.Semaphore(3)   # max notebooks refreshing at once
+    section_sem = asyncio.Semaphore(4)   # max concurrent list_pages across all notebooks
 
-    # Run all refreshes concurrently; print a line as each one finishes so a
-    # timeout mid-step still shows which notebooks completed.
+    async def _refresh_one(nb_name):
+        async with nb_sem:
+            try:
+                return nb_name, await refresh_notebook(client, nb_name,
+                                                       section_sem=section_sem)
+            except Exception as e:
+                return nb_name, {'error': str(e)}
+
+    # Run all refreshes concurrently (gated by nb_sem); print a line as each
+    # one finishes so a timeout mid-step still shows which notebooks completed.
     refresh_results_dict: dict = {}
     done_nb = 0
     tasks = {asyncio.ensure_future(_refresh_one(n)): n for n in to_refresh}
