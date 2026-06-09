@@ -228,7 +228,13 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
         meta = {'model': MODEL, 'dim': EMBED_DIM, 'pages': {}, 'chunks': {}}
         force = True
 
-    existing_vecs = {} if force else _load_vectors()
+    # A full-corpus --force wipes and rebuilds everything. A --force scoped to a
+    # page subset (page_ids/pages_file) must NOT wipe — it force-rebuilds only
+    # the targeted pages and merges them into the existing store, preserving
+    # every other notebook. Carry-forward is already bypassed under force (see
+    # the `if not force` guard below), so loading existing_vecs here is safe.
+    wipe = force and not (page_ids or pages_file)
+    existing_vecs = {} if wipe else _load_vectors()
 
     # Build a single {pid: (nb, sec, page)} index so both the full-corpus
     # target list and the per-pid metadata lookup are O(1). Previously the
@@ -337,16 +343,16 @@ def build_embeddings(page_ids: list = None, pages_file: str = None,
             snap_kinds       = dict(new_kinds)
             snap_chunks_meta = dict(new_chunks_meta)
 
-        merged_vecs  = dict(existing_vecs) if not force else {}
+        merged_vecs  = dict(existing_vecs) if not wipe else {}
         merged_kinds = {cid: (meta.get('chunks', {}).get(cid, {}).get('kind') or '')
-                        for cid in existing_vecs} if not force else {}
+                        for cid in existing_vecs} if not wipe else {}
         merged_vecs.update(snap_vecs)
         merged_kinds.update(snap_kinds)
 
-        merged_chunks_meta = {} if force else dict(meta.get('chunks', {}))
+        merged_chunks_meta = {} if wipe else dict(meta.get('chunks', {}))
         merged_chunks_meta.update(snap_chunks_meta)
 
-        merged_pages_meta = {} if force else dict(meta.get('pages', {}))
+        merged_pages_meta = {} if wipe else dict(meta.get('pages', {}))
         merged_pages_meta.update(pages_to_rebuild)
 
         # Purge explicitly deleted pages before the live-chunk filter runs.

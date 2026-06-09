@@ -46,7 +46,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from onenote_cache import (
-    REFS_DIR, _content_path, _load_cache, load_content_cache, atomic_write,
+    REFS_DIR, _content_path, _load_cache, load_content_cache, atomic_write, _parse_lm,
 )
 from onenote_lock import duration_limit, DurationExceeded as SyncTimeout
 from onenote_media import gc_media
@@ -60,7 +60,22 @@ LOG_FILE       = REFS_DIR / 'sync.log'
 
 HEARTBEAT_INTERVAL  = 5.0
 DEFAULT_MAX_SECONDS = 600
-DEFAULT_MAX_CHANGES = 20    # abort if fetch or embed would touch more pages
+DEFAULT_MAX_CHANGES = 40    # abort if fetch or embed would touch more pages
+
+# Column widths for the per-notebook refresh table (estimated from typical data;
+# the notebook list rarely changes so dynamic sizing is not worth the complexity).
+_NB_W = (3, 20, 18, 11, 6, 8, 6)  # #, name, pages/sect, date, size, changes, time
+_NB_HEADERS = ('#', 'Notebook', 'Pages / Sections', 'Modified', 'Size', 'Changes', 'Time')
+
+
+def _nb_hline(left='├', mid='┼', right='┤') -> str:
+    return left + mid.join('─' * (w + 2) for w in _NB_W) + right
+
+
+def _nb_row(num: str, name: str, pgs: str, date: str, size: str, chg: str, t: str) -> str:
+    w = _NB_W
+    return (f'│ {num:>{w[0]}} │ {name:<{w[1]}} │ {pgs:<{w[2]}} │ '
+            f'{date:<{w[3]}} │ {size:>{w[4]}} │ {chg:<{w[5]}} │ {t:>{w[6]}} │')
 
 
 class ThresholdExceeded(Exception):
@@ -475,7 +490,8 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
                       max_changes: int = 0, force: bool = False,
                       notebook_name: str | None = None,
                       section_name: str | None = None,
-                      page_title: str | None = None) -> dict:
+                      page_title: str | None = None,
+                      concurrency: int = 5) -> dict:
     from onenote_setup import make_graph_client, list_notebooks
     from onenote_api import refresh_notebook, fetch_pages_by_id
 
@@ -507,33 +523,59 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     before = _snapshot_pages(cache)
 
     n_nb = len(to_refresh)
-    _set_step(f'refreshing {n_nb} notebook{"" if n_nb == 1 else "s"}')
-
     # Single semaphore caps total concurrent Graph API calls (list_sections +
     # list_pages combined) across all notebooks. list_sections must finish
     # before list_pages can start for a given notebook, so a shared limit
-    # of 4 naturally interleaves both call types without over-requesting.
-    graph_sem = asyncio.Semaphore(4)
+    # naturally interleaves both call types without over-requesting.
+    _set_step(f'Fetching section & page metadata using Graph API — {n_nb} notebook{"" if n_nb == 1 else "s"} [concurrency={concurrency}]')
+    graph_sem = asyncio.Semaphore(concurrency)
 
     async def _refresh_one(nb_name):
+        t0 = time.perf_counter()
         try:
             return nb_name, await refresh_notebook(client, nb_name,
                                                    graph_sem=graph_sem)
         except Exception as e:
-            return nb_name, {'error': str(e)}
+            return nb_name, {'error': str(e), 'elapsed_sec': time.perf_counter() - t0}
 
-    # Run all refreshes concurrently (gated by nb_sem); print a line as each
-    # one finishes so a timeout mid-step still shows which notebooks completed.
+    # Run all refreshes concurrently; print a table row per notebook as each
+    # finishes (completion order) so a timeout mid-step still shows progress.
+    # Per-notebook diff is computed here using the page_lm map returned by
+    # refresh_notebook, avoiding a second cache load.
     refresh_results_dict: dict = {}
     done_nb = 0
     tasks = {asyncio.ensure_future(_refresh_one(n)): n for n in to_refresh}
+    print(_nb_hline('┌', '┬', '┐'))
+    print(_nb_row(*_NB_HEADERS))
+    print(_nb_hline())
     for fut in asyncio.as_completed(tasks):
         nb_name, info = await fut
+        nb_elapsed = info.get('elapsed_sec', 0.0)
         refresh_results_dict[nb_name] = info
         done_nb += 1
-        status = f'error: {info["error"][:40]}' if 'error' in info else \
-                 f'{info.get("pages","?")}p / {info.get("sections","?")}s'
-        print(f'             [{done_nb}/{n_nb}] {nb_name} — {status}', flush=True)
+        t_str = f'{nb_elapsed:.1f}s'
+        if 'error' in info:
+            print(_nb_row(f'{done_nb}.', nb_name, 'error', info['error'][:11], '', '', t_str), flush=True)
+        else:
+            nb_before  = {pid: v for pid, v in before.items() if v[0] == nb_name}
+            after_lm   = info.get('page_lm', {})
+            added_n    = len(set(after_lm) - set(nb_before))
+            deleted_n  = len(set(nb_before) - set(after_lm))
+            modified_n = len({pid for pid in set(after_lm) & set(nb_before)
+                              if after_lm[pid] != nb_before[pid][3]})
+            ch = []
+            if added_n:    ch.append(f'+{added_n}')
+            if modified_n: ch.append(f'~{modified_n}')
+            if deleted_n:  ch.append(f'-{deleted_n}')
+            change_str = ', '.join(ch)
+            emoji    = ' ✨' if nb_name in unknown_set else (' ⚡' if ch else '')
+            lm_dt    = _parse_lm(info.get('last_modified', ''))
+            date_str = lm_dt.strftime('%d %b %Y') if lm_dt else '?'
+            size_str = _fmt_size(_notebook_html_size(nb_name), precision=0)
+            pgs_str  = f'{str(info.get("pages","?")):>3} pgs / {str(info.get("sections","?")):>2} sect'
+            print(_nb_row(f'{done_nb}.', nb_name + emoji, pgs_str,
+                          date_str, size_str, change_str, t_str), flush=True)
+    print(_nb_hline('└', '┴', '┘'))
 
     refresh_results = list(refresh_results_dict.items())
     refresh_errors = {nb: info['error'] for nb, info in refresh_results if 'error' in info}
@@ -576,37 +618,6 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
     dirty_notebooks = {after[pid][0] for pid in (modified_ids | added_ids | missing_html_ids)}
     dirty_set = dirty_notebooks - unknown_set  # ✨ for new notebooks wins over ⚡
 
-    if verbose:
-        info_by_nb = dict(refresh_results)
-        # Bucket page-level diffs by notebook for per-notebook reporting.
-        nb_changes: dict = {}
-        for pid in added_ids:
-            nb_changes.setdefault(after[pid][0], [0, 0, 0])[0] += 1
-        for pid in modified_ids:
-            nb_changes.setdefault(after[pid][0], [0, 0, 0])[1] += 1
-        for pid in deleted_ids:
-            nb_changes.setdefault(before[pid][0], [0, 0, 0])[2] += 1
-        for idx, nb_name in enumerate(to_refresh, 1):
-            info = info_by_nb.get(nb_name, {})
-            if nb_name in unknown_set:
-                marker = '✨ '
-            elif nb_name in dirty_set:
-                marker = '⚡ '
-            else:
-                marker = ''
-            if 'error' in info:
-                suffix = f'  [{_format_error(info["error"])}]'
-            else:
-                a, m, d = nb_changes.get(nb_name, (0, 0, 0))
-                ch = []
-                if a: ch.append(f'+{a}')
-                if m: ch.append(f'~{m}')
-                if d: ch.append(f'-{d}')
-                pages_suffix = f' ({",".join(ch)})' if ch else ''
-                suffix = (f' — {info.get("pages", "?")} pages{pages_suffix}, '
-                          f'{info.get("sections", "?")} sections, '
-                          f'{_fmt_size(_notebook_html_size(nb_name), precision=0)} html')
-            print(f'             {idx}. {marker}{nb_name}{suffix}', flush=True)
 
     # Sweep orphans across all per-page artifacts (content html/meta,
     # rendered html, subject classifications). Self-healing — handles both
@@ -656,7 +667,7 @@ async def _sync_async(force_embed: bool, verbose: bool = False,
                   'label': f'{after[pid][0]} / {after[pid][1]} / {after[pid][2]}'}
                  for pid in to_fetch_ids]
         results = await fetch_pages_by_id(client, items, on_progress=_on_page_done,
-                                          force_refetch=force)
+                                          force_refetch=force, concurrency=concurrency)
         label_by_id = {it['page_id']: it['label'] for it in items}
         for r in results:
             if 'error' in r:
@@ -757,6 +768,7 @@ def cmd_sync(args) -> int:
                 notebook_name=nb_parts[0] if len(nb_parts) >= 1 else None,
                 section_name=nb_parts[1] if len(nb_parts) >= 2 else None,
                 page_title=nb_parts[2]    if len(nb_parts) >= 3 else None,
+                concurrency=args.concurrency,
             ))
         state.update({
             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -1214,7 +1226,7 @@ def main() -> int:
     # subcommand is given.
     ap.set_defaults(cmd='sync', force_embed=False, quiet=False, verbose=True,
                     max_duration=DEFAULT_MAX_SECONDS,
-                    max_changes=DEFAULT_MAX_CHANGES, force=False)
+                    max_changes=DEFAULT_MAX_CHANGES, force=False, concurrency=5)
     sub = ap.add_subparsers(dest='cmd')
 
     ps = sub.add_parser('sync', help='sync now (default if no subcommand)')
@@ -1235,6 +1247,10 @@ def main() -> int:
                     help='ignore last_modified timestamps — re-fetch HTML and rebuild '
                          'embeddings for all pages in scope regardless of whether '
                          'Graph reports them as changed. Also bypasses --max-changes.')
+    ps.add_argument('--concurrency', type=int, default=5, metavar='N',
+                    help='max concurrent Graph API calls for both metadata refresh and '
+                         'page content fetch (default 5). Raise to speed up large syncs; '
+                         'lower if you are hitting 429 rate limits.')
 
     status_parser = sub.add_parser('status',  help='report idle / running state, plus cache sizes')
     status_parser.add_argument('-v', '--verbose', action='store_true',

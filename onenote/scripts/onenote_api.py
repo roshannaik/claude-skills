@@ -89,20 +89,33 @@ async def refresh_notebook(client, notebook_name: str,
     (list_sections + list_pages combined) across all notebooks refreshing in
     parallel. A per-call default is created when not provided.
     """
+    import time as _time
     from onenote_setup import list_pages
     sem = graph_sem or asyncio.Semaphore(4)
 
     async with sem:
+        # Record start time only after acquiring the semaphore — this is when
+        # actual API work begins. Notebooks waiting on a busy semaphore would
+        # otherwise inflate their elapsed time with idle wait.
+        t0 = _time.perf_counter()
         sections = await get_sections(client, notebook_name)
 
     async def _fetch(sec):
         async with sem:
             pages = await list_pages(client, sec['id'])
         update_pages_cache(notebook_name, sec['name'], pages)
-        return len(pages)
+        max_lm  = max((p.get('last_modified', '') for p in pages), default='')
+        page_lm = {p['id']: p.get('last_modified', '') for p in pages if p.get('id')}
+        return len(pages), max_lm, page_lm
 
-    counts = await asyncio.gather(*[_fetch(s) for s in sections])
-    return {'sections': len(sections), 'pages': sum(counts)}
+    results = await asyncio.gather(*[_fetch(s) for s in sections])
+    all_page_lm: dict = {}
+    for r in results:
+        all_page_lm.update(r[2])
+    max_lm = max((r[1] for r in results), default='')
+    return {'sections': len(sections), 'pages': sum(r[0] for r in results),
+            'last_modified': max_lm, 'page_lm': all_page_lm,
+            'elapsed_sec': _time.perf_counter() - t0}
 
 
 async def find_page(client=None, notebook_name: str = None, section_name: str = None,
@@ -154,7 +167,8 @@ _FETCH_TIMEOUT_S   = 60  # per-page timeout; hung requests become errors, not ha
 
 
 async def fetch_pages_by_id(client=None, items: list[dict] = None,
-                            on_progress=None, force_refetch: bool = False) -> list[dict]:
+                            on_progress=None, force_refetch: bool = False,
+                            concurrency: int | None = None) -> list[dict]:
     """Fetch pages by page_id directly, bypassing title-based lookup.
 
     items = [{'page_id': ..., 'last_modified': ..., 'label': '<for progress>'}, ...]
@@ -177,7 +191,7 @@ async def fetch_pages_by_id(client=None, items: list[dict] = None,
             client = make_graph_client()
         return client
 
-    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+    sem = asyncio.Semaphore(concurrency if concurrency is not None else _FETCH_CONCURRENCY)
 
     async def _fetch(item):
         import time

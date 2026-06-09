@@ -6,10 +6,13 @@ Force-rebuild: pass --force.
 
 Usage:
   python3 scripts/build_embeddings.py                                   # incremental, all pages
-  python3 scripts/build_embeddings.py --force                           # full rebuild
+  python3 scripts/build_embeddings.py --force                           # full rebuild (wipes store)
   python3 scripts/build_embeddings.py --pages-file cache/prototype.txt  # subset via file
   python3 scripts/build_embeddings.py --pages "Notebook / Section / Page" \
                                       --pages <page_id>                  # explicit list
+  python3 scripts/build_embeddings.py --force --pages-file pages.txt     # scoped force: re-embed
+                                      # ONLY those pages (e.g. after a chunker change), merging
+                                      # into the existing store — other notebooks are preserved.
 """
 import argparse
 import sys
@@ -21,7 +24,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--force', action='store_true',
-                    help='Re-embed every chunk (ignore last_modified freshness)')
+                    help='Re-embed every chunk (ignore last_modified freshness). '
+                         'With --pages/--pages-file, scoped to those pages and merged '
+                         'into the existing store; without a subset, wipes and rebuilds all.')
     ap.add_argument('--pages-file', metavar='PATH',
                     help='File with one page identifier per line')
     ap.add_argument('--pages', action='append', metavar='IDENT', default=[],

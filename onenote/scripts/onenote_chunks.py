@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-from onenote_cache import strip_html
+from onenote_cache import strip_html, html_to_md
 from onenote_media import (
     parse_resources, load_resource, _find_byte_file,
     _ocr_path, _caption_path, _transcript_path, _non_ws_len,
@@ -48,6 +48,7 @@ PARA_OWN_CHUNK_MIN_CHARS   = 150    # ... AND >= this many non-ws chars
 HEADING_HARD_MIN_CHARS     = 500    # heading becomes hard boundary if section >= this
 SUMMARY_CHAR_CAP           = 5000   # page-summary body cap
 TABLE_SMALL_CHAR_CAP       = 1500   # table treated as single chunk if body <= this
+LIST_LEAD_CTX_CAP          = 300    # cap on a split list's re-prefixed lead context
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +59,7 @@ _DIV_OPEN  = re.compile(r'<div\b[^>]*>',       re.I)
 _DIV_CLOSE = re.compile(r'</div>',              re.I)
 _H_TAG     = re.compile(r'<(h[1-4])\b[^>]*>(.*?)</\1>', re.I | re.S)
 _P_TAG     = re.compile(r'<p\b[^>]*>(.*?)</p>',        re.I | re.S)
-_LIST_TAG  = re.compile(r'<(ul|ol)\b[^>]*>(.*?)</\1>', re.I | re.S)
 _HR_TAG    = re.compile(r'<hr\b[^>]*/?>',              re.I)
-_LI_TAG    = re.compile(r'<li\b[^>]*>(.*?)</li>',      re.I | re.S)
 _BOLD_ONLY = re.compile(r'^\s*<(b|strong|span[^>]*font-weight:\s*bold[^>]*)>(.+?)</\1>\s*$', re.I | re.S)
 
 # Balanced-tag scanning for table / tr / td — non-greedy regex can't handle
@@ -173,8 +172,14 @@ def _extract_blocks(html: str) -> list:
     for open_start, close_end, inner_start, inner_end in _balanced_tag_spans(html, 'table'):
         hits.append((open_start, close_end, 'table', 'table',
                      html[inner_start:inner_end]))
-    for m in _LIST_TAG.finditer(html):
-        hits.append((m.start(), m.end(), 'list', m.group(1).lower(), m.group(2)))
+    # Lists: balanced-span scan (not non-greedy regex) so a nested same-tag
+    # list inside an <li> doesn't truncate the outer list at the first closer.
+    # The sort+max_end dedup below drops any inner ul/ol whose start falls
+    # inside an already-accepted outer list.
+    for tag in ('ul', 'ol'):
+        for open_start, close_end, inner_start, inner_end in _balanced_tag_spans(html, tag):
+            hits.append((open_start, close_end, 'list', tag,
+                         html[inner_start:inner_end]))
     for m in _HR_TAG.finditer(html):
         hits.append((m.start(), m.end(), 'hr', 'hr', ''))
 
@@ -408,6 +413,116 @@ def _chunk_table(page_id: str, table_html: str,
 
 
 # ---------------------------------------------------------------------------
+# List handling
+# ---------------------------------------------------------------------------
+#
+# Policy: a list is rendered with `html_to_md` so nesting + numbering + the
+# context line(s) that sit directly under a <ul>/<ol> (before any <li>) are
+# preserved. Small lists (<= CHUNK_HARD_MAX_CHARS) are packed inline with
+# neighbouring text so they keep their surrounding context. Larger lists are
+# split at TOP-LEVEL item boundaries (a sub-bullet never leaves its parent),
+# and every resulting chunk is re-prefixed with the list's lead context line(s)
+# — the list analogue of the table header re-prefix — so the nesting context
+# rides along no matter where the split lands.
+
+_LIST_MARKER = re.compile(r'^(?:[-*]\s|\d+\.\s)')
+
+
+def _split_rendered_list(rendered: str) -> tuple:
+    """Split `html_to_md` list output into (lead_lines, item_blocks).
+
+    `html_to_md` emits top-level items at column 0 and indents descendants by
+    two spaces per level. So: leading column-0 lines that are NOT list markers
+    are lead context; each column-0 marker line starts a new top-level item and
+    owns every following indented / blank / wrapped line until the next
+    column-0 marker.
+    """
+    lead, blocks, cur = [], [], None
+    for ln in rendered.split('\n'):
+        stripped = ln.strip()
+        indented = bool(ln) and ln[0] in ' \t'
+        top_level = bool(stripped) and not indented
+        if top_level and _LIST_MARKER.match(ln):
+            cur = [ln]
+            blocks.append(cur)
+        elif cur is None:
+            if stripped:                      # pre-item context line
+                lead.append(stripped)
+        else:
+            cur.append(ln)                    # continuation of current item
+    return lead, ['\n'.join(b).rstrip() for b in blocks]
+
+
+def _chunk_list(page_id: str, list_html: str,
+                page_meta: dict, heading_path: list,
+                seq_start: int) -> tuple:
+    """Chunk an oversized list. Returns (chunks, next_seq).
+
+    Splits at top-level item boundaries; each chunk carries the list's lead
+    context (the line(s) that introduce the list) so the nested semantic
+    context is never orphaned.
+    """
+    rendered = html_to_md(list_html)
+    lead, items = _split_rendered_list(rendered)
+    if not items:
+        return [], seq_start
+
+    routing = _build_routing_header(page_meta, heading_path, [])
+    ctx = ''
+    if lead:
+        lead_text = ' / '.join(lead)
+        if len(lead_text) > LIST_LEAD_CTX_CAP:
+            # Lead is a full intro paragraph, not a header line — keep it as a
+            # bounded context cue (full text still lives in the page summary).
+            cut = lead_text.rfind(' ', 0, LIST_LEAD_CTX_CAP)
+            lead_text = lead_text[:cut if cut > 0 else LIST_LEAD_CTX_CAP].rstrip() + ' …'
+        ctx = 'List context: ' + lead_text + '\n'
+    budget = max(400, CHUNK_TARGET_CHARS - len(ctx))
+
+    chunks, seq, cur, cur_len = [], seq_start, [], 0
+
+    def _emit(parts, source, extra=None):
+        nonlocal seq
+        body = '\n'.join(parts)
+        text = routing + ctx + body
+        chunks.append(Chunk(
+            chunk_id   = f'{page_id}#t{seq:04d}',
+            kind       = 'text',
+            page_id    = page_id,
+            embed_text = text,
+            heading_path = list(heading_path),
+            char_count = len(text),
+            extra      = {'source': source, **(extra or {})},
+        ))
+        seq += 1
+
+    def _flush():
+        nonlocal cur, cur_len
+        if cur:
+            _emit(cur, 'list')
+            cur, cur_len = [], 0
+
+    for item in items:
+        if len(item) > CHUNK_HARD_MAX_CHARS:
+            # Pathologically fat single item: window-split, re-prefixing the
+            # item's own first line (its parent bullet) so the anchor rides
+            # along on top of the list's lead context.
+            _flush()
+            label = item.split('\n', 1)[0].strip()[:120]
+            for part_n, slice_text in enumerate(_split_oversized_paragraph(item), 1):
+                _emit([f'[{label}  part {part_n}]', slice_text],
+                      'list_item_window', {'part': part_n})
+            continue
+        if cur and cur_len + len(item) + 1 > budget:
+            _flush()
+        cur.append(item)
+        cur_len += len(item) + 1
+    _flush()
+
+    return chunks, seq
+
+
+# ---------------------------------------------------------------------------
 # Text-block packing
 # ---------------------------------------------------------------------------
 
@@ -560,11 +675,22 @@ def chunk_page(page_id: str, html: str, page_meta: dict) -> list:
             continue
 
         if b['kind'] == 'list':
-            # Each top-level <li> as a paragraph-like item
-            for m in _LI_TAG.finditer(b['html']):
-                txt = _clean(m.group(1))
-                if txt:
-                    packer.add('- ' + txt)
+            # Render via DOM so nesting, numbering, and the context line(s)
+            # that sit directly under the <ul>/<ol> are preserved. Small lists
+            # pack inline with neighbours; large lists get dedicated chunks that
+            # re-prefix the lead context at every split (see _chunk_list).
+            list_html = f"<{b['tag']}>{b['html']}</{b['tag']}>"
+            rendered = html_to_md(list_html)
+            if not rendered.strip():
+                continue
+            if len(rendered) <= CHUNK_HARD_MAX_CHARS:
+                packer.add(rendered)
+            else:
+                packer.flush()
+                ch, _ = _chunk_list(page_id, list_html, page_meta,
+                                    packer.heading_path, packer.seq)
+                packer.chunks.extend(ch)
+                packer.seq += len(ch)
             continue
 
         if b['kind'] == 'para':
