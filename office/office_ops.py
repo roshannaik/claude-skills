@@ -108,11 +108,26 @@ def _graph(path: str, method='GET', body=None, content_type='application/json') 
         return json.loads(r.read()) if r.length != 0 else {}
 
 
+class _DownloadRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow preauthenticated download URLs without forwarding Graph tokens."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlparse(newurl).scheme != 'https':
+            raise ValueError('Refusing non-HTTPS download redirect')
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.remove_header('Authorization')
+        return redirected
+
+
 def _graph_bytes(path: str) -> bytes:
     token = get_access_token()
     url = f'https://graph.microsoft.com/v1.0{path}'
     req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
-    with urllib.request.urlopen(req) as r:
+    # Graph redirects /content to a short-lived, preauthenticated download URL.
+    # The bearer token belongs only on the initial Graph request.
+    opener = urllib.request.build_opener(_DownloadRedirectHandler())
+    with opener.open(req) as r:
         return r.read()
 
 
